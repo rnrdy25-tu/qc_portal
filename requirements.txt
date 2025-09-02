@@ -1,0 +1,7 @@
+streamlit
+pandas
+pillow
+matplotlib
+requests
+# optional: enable if you add the QR banner feature
+# qrcode[pil]
