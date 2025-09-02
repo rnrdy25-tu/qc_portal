@@ -1,7 +1,5 @@
-streamlit
-pandas
-Pillow
-requests
+streamlit==1.36.0
+pandas>=2.1
+Pillow>=10.0
 openpyxl>=3.1
-# only if you need to import legacy .xls files:
-xlrd==1.2.0
+requests>=2.32
