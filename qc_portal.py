@@ -131,7 +131,9 @@ CREATE TABLE IF NOT EXISTS findings (
 SCHEMA_MODELS = """
 CREATE TABLE IF NOT EXISTS models (
     model_no TEXT PRIMARY KEY,
-    name TEXT
+    name TEXT,
+    customer TEXT,
+    bucket TEXT
 );
 """
 
@@ -143,7 +145,11 @@ def get_conn():
 @st.cache_data(show_spinner=False)
 def list_models():
     with get_conn() as c:
-        return pd.read_sql_query("SELECT model_no, COALESCE(name,'') AS name FROM models ORDER BY model_no", c)
+        return pd.read_sql_query(
+            "SELECT model_no, COALESCE(name,'') AS name, COALESCE(customer,'') AS customer, COALESCE(bucket,'') AS bucket "
+            "FROM models ORDER BY model_no",
+            c
+        )
 
 @st.cache_data(show_spinner=False)
 def load_findings(model_no: str, days: int | None = None):
@@ -160,6 +166,12 @@ def load_findings(model_no: str, days: int | None = None):
 def init_db():
     with get_conn() as c:
         c.execute(SCHEMA_MODELS)
+        # add missing columns for models (safe migration)
+cols = {row[1] for row in c.execute("PRAGMA table_info(models)").fetchall()}
+if "customer" not in cols:
+    c.execute("ALTER TABLE models ADD COLUMN customer TEXT")
+if "bucket" not in cols:
+    c.execute("ALTER TABLE models ADD COLUMN bucket TEXT")
         c.execute(SCHEMA_FINDINGS)
         # Add missing columns on the fly (safe migrations)
         existing = {row[1] for row in c.execute("PRAGMA table_info(findings)").fetchall()}
@@ -221,6 +233,79 @@ def upsert_model(model_no: str, name: str = ""):
             (model_no.strip(), name.strip()),
         )
         c.commit()
+def update_model_meta(model_no: str, name: str, customer: str, bucket: str):
+    with get_conn() as c:
+        c.execute(
+            "UPDATE models SET name=?, customer=?, bucket=? WHERE model_no=?",
+            (name.strip(), customer.strip(), bucket.strip(), model_no.strip())
+        )
+        c.commit()
+
+def rename_model(old_no: str, new_no: str, move_images: bool = True):
+    old_no, new_no = old_no.strip(), new_no.strip()
+    if not old_no or not new_no or old_no == new_no:
+        return "Invalid model numbers."
+
+    with get_conn() as c:
+        # read old row
+        row = c.execute("SELECT model_no, name, customer, bucket FROM models WHERE model_no=?", (old_no,)).fetchone()
+        if not row:
+            return f"Model {old_no} not found."
+
+        name, customer, bucket = row[1], row[2], row[3]
+
+        # insert/replace new row
+        c.execute(
+            "INSERT INTO models(model_no, name, customer, bucket) VALUES(?,?,?,?) "
+            "ON CONFLICT(model_no) DO UPDATE SET name=excluded.name, customer=excluded.customer, bucket=excluded.bucket",
+            (new_no, name or "", customer or "", bucket or "")
+        )
+        # update foreign keys
+        c.execute("UPDATE findings SET model_no=? WHERE model_no=?", (new_no, old_no))
+        c.execute("UPDATE criteria SET model_no=? WHERE model_no=?", (new_no, old_no))
+        # remove old row
+        c.execute("DELETE FROM models WHERE model_no=?", (old_no,))
+        c.commit()
+
+    # move image folder
+    if move_images:
+        src = (IMG_DIR / old_no)
+        dst = (IMG_DIR / new_no)
+        try:
+            if src.exists() and not dst.exists():
+                src.rename(dst)
+        except Exception:
+            # ignore file-system errors, DB is already consistent
+            pass
+    # clear cache
+    list_models.clear()
+    return None  # success
+
+def delete_model_all(model_no: str, delete_images: bool = False, delete_findings: bool = True, delete_criteria: bool = True):
+    with get_conn() as c:
+        if delete_findings:
+            c.execute("DELETE FROM findings WHERE model_no=?", (model_no,))
+        if delete_criteria:
+            c.execute("DELETE FROM criteria WHERE model_no=?", (model_no,))
+        c.execute("DELETE FROM models WHERE model_no=?", (model_no,))
+        c.commit()
+    if delete_images:
+        folder = IMG_DIR / model_no
+        try:
+            if folder.exists():
+                # delete all files then the folder
+                for p in folder.glob("**/*"):
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+                try:
+                    folder.rmdir()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    list_models.clear()
 
 def save_image(model_no: str, uploaded_file) -> str:
     model_folder = IMG_DIR / model_no
@@ -361,23 +446,75 @@ with st.sidebar:
                 st.error("Please enter a model number")
 
     with st.expander("Models"):
-        mdf = list_models()
-        if mdf.empty:
-            st.caption("No models yet.")
-        else:
-            options = mdf["model_no"].tolist()
-            label_by_model = {m: (n if str(n).strip() else m) for m, n in zip(mdf["model_no"], mdf["name"])}
-            filt = st.text_input("Filter", "", key="models_filter_sidebar")
-            if filt.strip():
-                s = filt.lower().strip()
-                options = [m for m in options if s in (m.lower() + " " + str(label_by_model[m]).lower())]
-            st.radio(
-                "Select a model",
-                options=options,
-                key="model_pick",
-                format_func=lambda m: label_by_model.get(m, m),
-                on_change=_set_selected_model
-            )
+    mdf = list_models()
+    if mdf.empty:
+        st.caption("No models yet.")
+    else:
+        # filter by Customer (file server / account)
+        customers = ["All"] + sorted([x for x in mdf["customer"].dropna().unique() if str(x).strip()])
+        pick_cust = st.selectbox("Customer / Group", customers, index=0, key="cust_filter")
+        if pick_cust != "All":
+            mdf = mdf[mdf["customer"] == pick_cust]
+
+        # quick filter box
+        filt = st.text_input("Filter", "", key="models_filter_sidebar")
+        if filt.strip():
+            s = filt.lower().strip()
+            mdf = mdf[mdf.apply(lambda r: s in (r["model_no"] + " " + r["name"] + " " + r["customer"] + " " + r["bucket"]).lower(), axis=1)]
+
+        # radio list (click fills search box)
+        options = mdf["model_no"].tolist()
+        label_map = {
+            r["model_no"]: f'{r["name"] or r["model_no"]}  •  {r["model_no"]}' + (f'  ({r["customer"]})' if r["customer"] else "")
+            for _, r in mdf.iterrows()
+        }
+        def _on_pick():
+            picked = st.session_state.get("model_pick")
+            st.session_state["search_model"] = picked
+            st.session_state["rep_model"] = picked
+        st.radio("Select a model", options=options, key="model_pick", format_func=lambda m: label_map.get(m, m), on_change=_on_pick)
+
+        # management panel for the selected model
+        sel = st.session_state.get("model_pick")
+        if sel:
+            st.markdown("---")
+            st.subheader("Manage selected model")
+
+            row = mdf[mdf["model_no"] == sel].iloc[0] if not mdf[mdf["model_no"] == sel].empty else None
+            name_val = st.text_input("Display name", value=(row["name"] if row is not None else ""))
+            customer_val = st.text_input("Customer / File server", value=(row["customer"] if row is not None else ""))
+            bucket_val = st.text_input("Bucket / Group tag", value=(row["bucket"] if row is not None else ""))
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("💾 Save name/customer/bucket", key="save_model_meta"):
+                    update_model_meta(sel, name_val, customer_val, bucket_val)
+                    list_models.clear()
+                    st.success("Saved.")
+            with c2:
+                new_no = st.text_input("Rename model number", value=sel, key="rename_model_no")
+                if st.button("✏️ Rename model number", key="btn_rename_model"):
+                    err = rename_model(sel, new_no, move_images=True)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.success(f"Renamed {sel} → {new_no}")
+                        st.session_state["model_pick"] = new_no
+                        st.session_state["search_model"] = new_no
+                        st.session_state["rep_model"] = new_no
+                        st.experimental_rerun()
+
+            st.markdown("#### Danger zone")
+            del_find = st.checkbox("Also delete all findings (DB)", value=True, key="del_findings_chk")
+            del_imgs = st.checkbox("Also delete image files", value=False, key="del_images_chk")
+            del_crit = st.checkbox("Also delete criteria (DB)", value=False, key="del_criteria_chk")
+            if st.button("🗑️ Delete this model", key="btn_delete_model"):
+                delete_model_all(sel, delete_images=del_imgs, delete_findings=del_find, delete_criteria=del_crit)
+                st.success(f"Deleted model {sel}")
+                st.session_state.pop("model_pick", None)
+                st.session_state.pop("search_model", None)
+                st.session_state.pop("rep_model", None)
+                st.experimental_rerun()
 
     with st.expander("Report New Finding", expanded=True):
         rep_model = st.text_input("Model/Part No.", value=st.session_state.get("rep_model", ""))
@@ -697,4 +834,5 @@ if query:
                                 st.rerun()
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
