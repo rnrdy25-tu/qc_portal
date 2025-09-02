@@ -474,6 +474,65 @@ st.title("🔎 QC Portal – History & Reporting")
 # -------- Sidebar --------
 with st.sidebar:
     st.header("Admin")
+    # --- Manage selected model (SIDEBAR) ---
+sel = st.session_state.get("search_model") or st.session_state.get("model_pick")
+if sel:
+    st.markdown("---")
+    st.subheader("Manage selected model")
+
+    row = mdf[mdf["model_no"] == sel]
+    row = row.iloc[0] if not row.empty else None
+
+    # Unique keys so they don't clash with Add/Update Model fields
+    name_val = st.text_input(
+        "Display name",
+        value=(row["name"] if row is not None else ""),
+        key=f"mgr_name_{sel}",
+    )
+    customer_val = st.text_input(
+        "Customer",
+        value=(row["customer"] if row is not None else ""),
+        key=f"mgr_customer_{sel}",
+    )
+
+    folder_choices = [""] + (fdf["name"].tolist() if not fdf.empty else [])
+    current_folder = row["bucket"] if row is not None else ""
+    folder_sel = st.selectbox(
+        "Folder",
+        folder_choices,
+        index=(folder_choices.index(current_folder) if current_folder in folder_choices else 0),
+        key=f"mgr_folder_{sel}",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("💾 Save name/customer/folder", key=f"mgr_save_{sel}"):
+            update_model_meta(sel, name_val, customer_val, folder_sel)
+            st.success("Saved.")
+            list_models.clear()
+    with c2:
+        new_no = st.text_input("Rename model number", value=sel, key=f"mgr_rename_{sel}")
+        if st.button("✏️ Rename model number", key=f"mgr_btn_rename_{sel}"):
+            err = rename_model(sel, new_no, move_images=True)
+            if err:
+                st.error(err)
+            else:
+                st.success(f"Renamed {sel} → {new_no}")
+                st.session_state["search_model"] = new_no
+                st.session_state["rep_model"] = new_no
+                st.rerun()
+
+    st.markdown("#### Danger zone")
+    del_find = st.checkbox("Also delete all findings (DB)", value=True, key=f"mgr_del_find_{sel}")
+    del_imgs = st.checkbox("Also delete image files", value=False, key=f"mgr_del_imgs_{sel}")
+    del_crit = st.checkbox("Also delete criteria (DB)", value=False, key=f"mgr_del_crit_{sel}")
+    if st.button("🗑️ Delete this model", key=f"mgr_btn_delete_{sel}"):
+        delete_model_all(sel, delete_images=del_imgs, delete_findings=del_find, delete_criteria=del_crit)
+        st.success(f"Deleted model {sel}")
+        st.session_state.pop("search_model", None)
+        st.session_state.pop("model_pick", None)
+        st.session_state.pop("rep_model", None)
+        st.rerun()
 
     # Add / Update Model
     with st.expander("Add/Update Model"):
@@ -578,48 +637,6 @@ for i, folder in enumerate(folder_names):
                 format_func=lambda m: label_map.get(m, m),
                 on_change=make_on_pick(radio_key),
             )
-
-        # Manage selected model
-        sel = st.session_state.get("search_model") or st.session_state.get("model_pick")
-        if sel:
-            st.markdown("---")
-            st.subheader("Manage selected model")
-            row = mdf[mdf["model_no"] == sel]
-            row = row.iloc[0] if not row.empty else None
-
-            name_val = st.text_input("Display name", value=(row["name"] if row is not None else ""))
-            customer_val = st.text_input("Customer", value=(row["customer"] if row is not None else ""))
-            folder_choices = [""] + (fdf["name"].tolist() if not fdf.empty else [])
-            current_folder = row["bucket"] if row is not None else ""
-            folder_sel = st.selectbox("Folder", folder_choices, index=(folder_choices.index(current_folder) if current_folder in folder_choices else 0))
-
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("💾 Save name/customer/folder", key="save_model_meta"):
-                    update_model_meta(sel, name_val, customer_val, folder_sel)
-                    st.success("Saved.")
-            with c2:
-                new_no = st.text_input("Rename model number", value=sel, key="rename_model_no")
-                if st.button("✏️ Rename model number", key="btn_rename_model"):
-                    err = rename_model(sel, new_no, move_images=True)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success(f"Renamed {sel} → {new_no}")
-                        st.session_state["search_model"] = new_no
-                        st.session_state["rep_model"] = new_no
-                        st.rerun()
-
-            st.markdown("#### Danger zone")
-            del_find = st.checkbox("Also delete all findings (DB)", value=True, key="del_findings_chk")
-            del_imgs = st.checkbox("Also delete image files", value=False, key="del_images_chk")
-            del_crit = st.checkbox("Also delete criteria (DB)", value=False, key="del_criteria_chk")
-            if st.button("🗑️ Delete this model", key="btn_delete_model"):
-                delete_model_all(sel, delete_images=del_imgs, delete_findings=del_find, delete_criteria=del_crit)
-                st.success(f"Deleted model {sel}")
-                st.session_state.pop("search_model", None)
-                st.session_state.pop("rep_model", None)
-                st.rerun()
 
     # Report New Finding
     with st.expander("Report New Finding", expanded=True):
@@ -933,4 +950,5 @@ if query:
 
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
