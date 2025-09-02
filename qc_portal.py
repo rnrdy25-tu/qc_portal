@@ -193,6 +193,34 @@ with st.sidebar:
             upsert_model(m_no, m_name)
             st.success("Model saved")
             list_models.clear()
+    # ---- Sidebar: Models index (names only; click to search) ----
+def _set_selected_model():
+    picked = st.session_state.get("model_pick")
+    if picked:
+        # set the main search box AND the sidebar report form's model (if present)
+        st.session_state["search_model"] = picked
+        st.session_state["rep_model"] = picked
+        st.rerun()
+        
+        with st.expander("Models"):
+    models_df = list_models()
+    if models_df.empty:
+        st.caption("No models yet.")
+    else:
+        # Build options = model_no; show label = name (or fallback to model_no)
+        options = models_df["model_no"].tolist()
+        label_by_model = {
+            m: (n if str(n).strip() else m)
+            for m, n in zip(models_df["model_no"], models_df["name"])
+        }
+        # A simple clickable list; on change we auto-fill the search box
+        st.radio(
+            "Select a model",
+            options=options,
+            key="model_pick",
+            format_func=lambda m: label_by_model.get(m, m),
+            on_change=_set_selected_model
+        )
 
     with st.expander("Report New Abnormality / Finding"):
         rep_model = st.text_input("Model number", key="rep_model")
@@ -221,41 +249,6 @@ with st.sidebar:
 models_df = list_models()
 
 # 📚 Models index (browse all models and see image directory)
-st.subheader("📚 Models index")
-stats_df = model_stats()
-if (not models_df.empty) or (not stats_df.empty):
-    merged = models_df.merge(stats_df, on="model_no", how="left")
-    if "findings" not in merged.columns:
-        merged["findings"] = 0
-    merged["findings"] = merged["findings"].fillna(0).astype(int)
-    merged["last_seen"] = merged.get("last_seen", pd.Series(dtype=str))
-    merged["image_dir"] = merged["model_no"].apply(lambda m: str((IMG_DIR / m).resolve()))
-
-    filt = st.text_input("Filter models", "", key="filter_models")
-    view_df = merged
-    if filt.strip():
-        s = filt.strip().lower()
-        view_df = merged[
-            merged["model_no"].str.lower().str.contains(s) | merged["name"].str.lower().str.contains(s)
-        ]
-    show_cols = ["model_no", "name", "findings", "last_seen", "image_dir"]
-    view_df = view_df[show_cols].sort_values(by=["findings", "model_no"], ascending=[False, True])
-    st.dataframe(view_df, use_container_width=True)
-
-    c_m1, c_m2, c_m3 = st.columns([3,1,1])
-    with c_m1:
-        model_pick = st.selectbox("Quick open model", [""] + view_df["model_no"].tolist(), index=0)
-    with c_m2:
-        if st.button("Open", key="open_model_btn") and model_pick:
-            st.session_state["search_model"] = model_pick
-            st.rerun()
-    with c_m3:
-        if st.button("Export index CSV", key="export_models"):
-            out = APP_DIR / f"models_index_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-            view_df.to_csv(out, index=False)
-            st.success(f"Exported: {out}")
-else:
-    st.caption("No models yet. Add one in the sidebar or create findings to populate this list.")
 
 query = st.text_input("Search model number", placeholder="Type model number…")
 days_filter = st.selectbox("Show findings from", ["All", "7 days", "30 days", "90 days"])
@@ -361,6 +354,7 @@ if st.session_state.get("edit_id") == rid:
 
 else:
     st.info("Type a model number above to view history.")
+
 
 
 
