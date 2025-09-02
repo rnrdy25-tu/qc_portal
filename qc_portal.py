@@ -466,91 +466,96 @@ def _set_selected_model():
         st.session_state["search_model"] = picked
         st.session_state["rep_model"] = picked
 
-# Sidebar
+# Sidebar: Admin & Reporting
 with st.sidebar:
     st.header("Admin")
 
-    with st.expander("Add/Update Model"):
-        m_no = st.text_input("Model number", key="mno_admin")
-        m_name = st.text_input("Name / Nickname (optional)")
-        if st.button("Save model"):
-            if m_no.strip():
-                upsert_model(m_no, m_name)
-                list_models.clear()
-                st.success("Model saved")
-            else:
-                st.error("Please enter a model number")
+    # ... your Add/Update Model expander here ...
 
+    # ---- Models (group, filter, manage) ----
     with st.expander("Models"):
-    mdf = list_models()
-    if mdf.empty:
-        st.caption("No models yet.")
-    else:
-        # filter by Customer (file server / account)
-        customers = ["All"] + sorted([x for x in mdf["customer"].dropna().unique() if str(x).strip()])
-        pick_cust = st.selectbox("Customer / Group", customers, index=0, key="cust_filter")
-        if pick_cust != "All":
-            mdf = mdf[mdf["customer"] == pick_cust]
+        mdf = list_models()  # <-- INDENTED under the expander
+        if mdf.empty:
+            st.caption("No models yet.")
+        else:
+            # filter by Customer / Group (optional)
+            customers = ["All"] + sorted([x for x in mdf["customer"].dropna().unique() if str(x).strip()])
+            pick_cust = st.selectbox("Customer / Group", customers, index=0, key="cust_filter")
+            if pick_cust != "All":
+                mdf = mdf[mdf["customer"] == pick_cust]
 
-        # quick filter box
-        filt = st.text_input("Filter", "", key="models_filter_sidebar")
-        if filt.strip():
-            s = filt.lower().strip()
-            mdf = mdf[mdf.apply(lambda r: s in (r["model_no"] + " " + r["name"] + " " + r["customer"] + " " + r["bucket"]).lower(), axis=1)]
+            # quick text filter
+            filt = st.text_input("Filter", "", key="models_filter_sidebar")
+            if filt.strip():
+                s = filt.lower().strip()
+                mdf = mdf[
+                    mdf.apply(
+                        lambda r: s in (r["model_no"] + " " + r["name"] + " " + r["customer"] + " " + r["bucket"]).lower(),
+                        axis=1,
+                    )
+                ]
 
-        # radio list (click fills search box)
-        options = mdf["model_no"].tolist()
-        label_map = {
-            r["model_no"]: f'{r["name"] or r["model_no"]}  •  {r["model_no"]}' + (f'  ({r["customer"]})' if r["customer"] else "")
-            for _, r in mdf.iterrows()
-        }
-        def _on_pick():
-            picked = st.session_state.get("model_pick")
-            st.session_state["search_model"] = picked
-            st.session_state["rep_model"] = picked
-        st.radio("Select a model", options=options, key="model_pick", format_func=lambda m: label_map.get(m, m), on_change=_on_pick)
+            # radio list (click fills search box)
+            options = mdf["model_no"].tolist()
+            label_map = {
+                r["model_no"]: f'{r["name"] or r["model_no"]}  •  {r["model_no"]}' + (f'  ({r["customer"]})' if r["customer"] else "")
+                for _, r in mdf.iterrows()
+            }
 
-        # management panel for the selected model
-        sel = st.session_state.get("model_pick")
-        if sel:
-            st.markdown("---")
-            st.subheader("Manage selected model")
+            def _on_pick():
+                picked = st.session_state.get("model_pick")
+                st.session_state["search_model"] = picked
+                st.session_state["rep_model"] = picked
 
-            row = mdf[mdf["model_no"] == sel].iloc[0] if not mdf[mdf["model_no"] == sel].empty else None
-            name_val = st.text_input("Display name", value=(row["name"] if row is not None else ""))
-            customer_val = st.text_input("Customer / File server", value=(row["customer"] if row is not None else ""))
-            bucket_val = st.text_input("Bucket / Group tag", value=(row["bucket"] if row is not None else ""))
+            st.radio(
+                "Select a model",
+                options=options,
+                key="model_pick",
+                format_func=lambda m: label_map.get(m, m),
+                on_change=_on_pick,
+            )
 
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("💾 Save name/customer/bucket", key="save_model_meta"):
-                    update_model_meta(sel, name_val, customer_val, bucket_val)
-                    list_models.clear()
-                    st.success("Saved.")
-            with c2:
-                new_no = st.text_input("Rename model number", value=sel, key="rename_model_no")
-                if st.button("✏️ Rename model number", key="btn_rename_model"):
-                    err = rename_model(sel, new_no, move_images=True)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success(f"Renamed {sel} → {new_no}")
-                        st.session_state["model_pick"] = new_no
-                        st.session_state["search_model"] = new_no
-                        st.session_state["rep_model"] = new_no
-                        st.experimental_rerun()
+            # --- Manage selected model ---
+            sel = st.session_state.get("model_pick")
+            if sel:
+                st.markdown("---")
+                st.subheader("Manage selected model")
 
-            st.markdown("#### Danger zone")
-            del_find = st.checkbox("Also delete all findings (DB)", value=True, key="del_findings_chk")
-            del_imgs = st.checkbox("Also delete image files", value=False, key="del_images_chk")
-            del_crit = st.checkbox("Also delete criteria (DB)", value=False, key="del_criteria_chk")
-            if st.button("🗑️ Delete this model", key="btn_delete_model"):
-                delete_model_all(sel, delete_images=del_imgs, delete_findings=del_find, delete_criteria=del_crit)
-                st.success(f"Deleted model {sel}")
-                st.session_state.pop("model_pick", None)
-                st.session_state.pop("search_model", None)
-                st.session_state.pop("rep_model", None)
-                st.experimental_rerun()
+                row = mdf[mdf["model_no"] == sel].iloc[0] if not mdf[mdf["model_no"] == sel].empty else None
+                name_val = st.text_input("Display name", value=(row["name"] if row is not None else ""))
+                customer_val = st.text_input("Customer / File server", value=(row["customer"] if row is not None else ""))
+                bucket_val = st.text_input("Bucket / Group tag", value=(row["bucket"] if row is not None else ""))
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("💾 Save name/customer/bucket", key="save_model_meta"):
+                        update_model_meta(sel, name_val, customer_val, bucket_val)
+                        list_models.clear()
+                        st.success("Saved.")
+                with c2:
+                    new_no = st.text_input("Rename model number", value=sel, key="rename_model_no")
+                    if st.button("✏️ Rename model number", key="btn_rename_model"):
+                        err = rename_model(sel, new_no, move_images=True)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success(f"Renamed {sel} → {new_no}")
+                            st.session_state["model_pick"] = new_no
+                            st.session_state["search_model"] = new_no
+                            st.session_state["rep_model"] = new_no
+                            st.rerun()
+
+                st.markdown("#### Danger zone")
+                del_find = st.checkbox("Also delete all findings (DB)", value=True, key="del_findings_chk")
+                del_imgs = st.checkbox("Also delete image files", value=False, key="del_images_chk")
+                del_crit = st.checkbox("Also delete criteria (DB)", value=False, key="del_criteria_chk")
+                if st.button("🗑️ Delete this model", key="btn_delete_model"):
+                    delete_model_all(sel, delete_images=del_imgs, delete_findings=del_find, delete_criteria=del_crit)
+                    st.success(f"Deleted model {sel}")
+                    st.session_state.pop("model_pick", None)
+                    st.session_state.pop("search_model", None)
+                    st.session_state.pop("rep_model", None)
+                    st.rerun()
 
     with st.expander("Report New Finding", expanded=True):
         rep_model = st.text_input("Model/Part No.", value=st.session_state.get("rep_model", ""))
@@ -882,6 +887,7 @@ if query:
                                 st.rerun()
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
 
 
