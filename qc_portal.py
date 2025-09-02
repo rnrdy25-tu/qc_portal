@@ -640,6 +640,18 @@ if query:
     if model_no and model_no not in models_df["model_no"].tolist():
         upsert_model(model_no)
         list_models.clear()
+        
+    # --- Show model meta (Customer / Group/Bucket) ---
+    mmeta = list_models()   # refresh cached list after potential upsert
+    meta_row = mmeta[mmeta["model_no"] == model_no]
+    if not meta_row.empty:
+        name = (meta_row.iloc[0]["name"] or "").strip()
+        cust = (meta_row.iloc[0].get("customer", "") or "").strip()
+        buck = (meta_row.iloc[0].get("bucket", "") or "").strip()
+        if name:
+            st.caption(f"Name: {name}")
+        if cust or buck:
+            st.caption(f"Customer: {cust or '-'}  •  Group: {buck or '-'}")
 
     st.subheader("🗂️ Past Findings")
     fdf = load_findings(model_no, selected_days)
@@ -834,5 +846,6 @@ if query:
                                 st.rerun()
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
 
