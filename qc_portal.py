@@ -33,7 +33,6 @@ IMG_DIR  = DATA_DIR / "images"
 CFG_DIR  = APP_DIR / "config"
 DB_PATH  = DATA_DIR / "qc_portal.sqlite3"
 
-
 DATA\_DIR.mkdir(exist\_ok=True)
 IMG\_DIR.mkdir(parents=True, exist\_ok=True)
 CFG\_DIR.mkdir(exist\_ok=True)
@@ -999,5 +998,6 @@ else:
 
 else:
 st.info(f"Type a model number above to view history.  |  LAN: http\://{LAN\_IP}:8501")
+
 
 
