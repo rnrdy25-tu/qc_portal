@@ -433,39 +433,49 @@ with st.sidebar:
         fdf = list_folders()
 
         # 2) Folder manager
+        # --- Nice styling (put once at top of sidebar or before this block) ---
+        st.markdown("""
+        <style>
+        /* Compact sidebar spacing & tidy buttons */
+        div[data-testid="stSidebar"] .block-container { padding-top: .5rem; }
+        .stButton > button { width: 100%; border-radius: 10px; }
+        .card { padding: .75rem; border: 1px solid #e5e7eb; border-radius: 12px; background: #fff; }
+        .badge { background:#eef2ff; color:#3730a3; padding:2px 8px; border-radius:999px; font-size:12px; }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # ---------- Folder manager (aesthetic) ----------
         st.markdown("**Folders**")
-        cfa, cfb, cfc = st.columns([2, 2, 1])
-        with cfa:
-            new_folder = st.text_input("New folder name", key="new_folder_name")
-            if st.button("➕ Create folder", key="btn_create_folder"):
-                add_folder(new_folder); st.success("Folder created")
-        with cfb:
-            existing = [""] + (fdf["name"].tolist() if not fdf.empty else [])
-            old_name = st.selectbox("Rename folder", existing, key="old_folder_sel")
-            new_name = st.text_input("→ New name", key="new_folder_newname")
-            if st.button("✏️ Rename folder", key="btn_rename_folder"):
-                if old_name:
-                    err = rename_folder(old_name, new_name)
-                    st.success("Renamed") if not err else st.error(err)
-        with cfc:
-            del_name = st.selectbox("Delete", (fdf["name"].tolist() if not fdf.empty else []), key="del_folder_sel")
-            if st.button("🗑️ Delete folder", key="btn_delete_folder"):
-                err = delete_folder(del_name)
-                st.success("Folder deleted") if not err else st.error(err)
-
-        st.markdown("---")
-
-        # 3) Filter models and build mdf_v safely
-        filt = st.text_input("Filter models", "", key="models_filter_sidebar")
-        mdf_v = mdf.copy()
-        if "bucket" not in mdf_v.columns:   mdf_v["bucket"] = ""
-        if "customer" not in mdf_v.columns: mdf_v["customer"] = ""
-
-        if filt.strip():
-            s = filt.lower().strip()
-            mdf_v = mdf_v[
-                mdf_v.apply(lambda r: s in (f"{r['model_no']} {r['name']} {r['customer']} {r['bucket']}".lower()), axis=1)
-            ]
+        with st.container():
+            col_a, col_b, col_c = st.columns([2, 2, 1])
+        
+            with col_a:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                nf = st.text_input("New folder", key="ui_new_folder", placeholder="e.g., SHURE")
+                if st.button("➕ Create", key="btn_create_folder", use_container_width=True):
+                    add_folder(nf); st.success("Folder created"); list_folders.clear()
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+            with col_b:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                existing = [""] + (fdf["name"].tolist() if not fdf.empty else [])
+                old = st.selectbox("Rename folder", existing, key="ui_old_folder")
+                new = st.text_input("→ New name", key="ui_new_folder_name")
+                if st.button("✏️ Rename", key="btn_rename_folder", use_container_width=True):
+                    if old:
+                        err = rename_folder(old, new)
+                        st.success("Renamed") if not err else st.error(err)
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+            with col_c:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                to_del = st.selectbox("Delete", (fdf["name"].tolist() if not fdf.empty else []), key="ui_del_folder")
+                if st.button("🗑️ Delete", key="btn_delete_folder", use_container_width=True):
+                    err = delete_folder(to_del)
+                    st.success("Deleted") if not err else st.error(err)
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        st.divider()
 
         # 4) Build full folder list (deduped) including Unassigned and empty folders
         seen = set()
@@ -487,33 +497,56 @@ with st.sidebar:
             return _cb
 
         # 5) Tree UI (unique radio key per folder row)
+                # ---------- Build a deduped folder list + counts ----------
+        tmp = mdf.copy()
+        tmp["bucket"] = tmp["bucket"].fillna("").apply(lambda x: x.strip())
+        tmp["__folder"] = tmp["bucket"].apply(lambda x: x if x else "Unassigned")
+        folder_counts = tmp["__folder"].value_counts().to_dict()
+        
+        seen = set()
+        folder_names = []
+        # from models
+        for b in mdf_v["bucket"].fillna("").tolist():
+            n = b.strip() if b.strip() else "Unassigned"
+            if n not in seen:
+                folder_names.append(n); seen.add(n)
+        # also include empty folders from the folders table
+        for n in (fdf["name"].tolist() if not fdf.empty else []):
+            if n not in seen:
+                folder_names.append(n); seen.add(n)
+        
+        # ---------- Tree UI (unique radio keys; no callbacks) ----------
         for i, folder in enumerate(folder_names):
-            st.markdown("")  # spacer
             tag = folder if folder != "Unassigned" else "Unassigned (no folder)"
-            with st.expander(f"📁 {tag}"):
+            count = folder_counts.get(folder, 0)
+            with st.expander(f"📁 {tag}  ·  {count} model(s)"):
                 if folder == "Unassigned":
                     sub = mdf_v[mdf_v["bucket"].fillna("").eq("")]
                 else:
                     sub = mdf_v[mdf_v["bucket"].fillna("").eq(folder)]
-
+        
                 if sub.empty:
                     st.caption("No models here yet.")
-                else:
-                    options = sub["model_no"].tolist()
-                    label_map = {
-                        r["model_no"]: f"{r['name'] or r['model_no']}  •  {r['model_no']}" +
-                                       (f"  ({r['customer']})" if r["customer"] else "")
-                        for _, r in sub.iterrows()
-                    }
-                    radio_key = f"folder_radio_{i}_{abs(hash(folder))%100000}"  # UNIQUE
-                    st.radio(
-                        "Select a model",
-                        options=options,
-                        key=radio_key,
-                        format_func=lambda m: label_map.get(m, m),
-                        on_change=make_on_pick(radio_key),
-                    )
-
+                    continue
+        
+                options = sub["model_no"].tolist()
+                label_map = {
+                    r["model_no"]: f"{r['name'] or r['model_no']}  •  {r['model_no']}" +
+                                   (f"  ({r['customer']})" if (r.get('customer') or '').strip() else "")
+                    for _, r in sub.iterrows()
+                }
+                radio_key = f"folder_radio_{i}"  # UNIQUE per folder-row
+                selected = st.radio(
+                    "Select a model",
+                    options=options,
+                    key=radio_key,
+                    format_func=lambda m: label_map.get(m, m),
+                )
+                # Directly push into session state so the main area updates
+                if selected:
+                    st.session_state["search_model"] = selected
+                    st.session_state["rep_model"] = selected
+                    
         # 6) Manage selected model (still in sidebar; unique keys)
         sel = st.session_state.get("search_model") or st.session_state.get("model_pick")
         if sel:
@@ -933,3 +966,4 @@ if query:
 
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
