@@ -20,11 +20,19 @@ import requests
 
 # ---------------------------- Paths & setup ----------------------------
 
-APP\_DIR = Path(__file__).parent.resolve()
-DATA\_DIR = APP\_DIR / "data"
-IMG\_DIR = DATA\_DIR / "images"
-CFG\_DIR = APP\_DIR / "config"
-DB\_PATH = DATA\_DIR / "qc\_portal.sqlite3"
+from pathlib import Path
+
+# Robust way (works even if __file__ isn't defined in some runtimes)
+try:
+    APP_DIR = Path(__file__).parent.resolve()
+except NameError:
+    APP_DIR = Path.cwd()
+
+DATA_DIR = APP_DIR / "data"
+IMG_DIR  = DATA_DIR / "images"
+CFG_DIR  = APP_DIR / "config"
+DB_PATH  = DATA_DIR / "qc_portal.sqlite3"
+
 
 DATA\_DIR.mkdir(exist\_ok=True)
 IMG\_DIR.mkdir(parents=True, exist\_ok=True)
@@ -991,4 +999,5 @@ else:
 
 else:
 st.info(f"Type a model number above to view history.  |  LAN: http\://{LAN\_IP}:8501")
+
 
