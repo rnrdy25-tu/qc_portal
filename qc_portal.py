@@ -201,19 +201,32 @@ def _set_selected_model():
         st.session_state["search_model"] = picked
         st.session_state["rep_model"] = picked
         st.rerun()
-        
-        with st.expander("Models"):
+        # ---- Sidebar: Models (names only; click to fill search) ----
+def _set_selected_model():
+    picked = st.session_state.get("model_pick")
+    if picked:
+        # auto-fill the main search bar and the sidebar report form
+        st.session_state["search_model"] = picked
+        st.session_state["rep_model"] = picked
+        st.rerun()
+
+with st.expander("Models"):
     models_df = list_models()
     if models_df.empty:
         st.caption("No models yet.")
     else:
-        # Build options = model_no; show label = name (or fallback to model_no)
         options = models_df["model_no"].tolist()
         label_by_model = {
             m: (n if str(n).strip() else m)
             for m, n in zip(models_df["model_no"], models_df["name"])
         }
-        # A simple clickable list; on change we auto-fill the search box
+
+        # optional tiny filter (keep or remove these 3 lines)
+        filt = st.text_input("Filter", "", key="models_filter_sidebar")
+        if filt.strip():
+            s = filt.lower().strip()
+            options = [m for m in options if s in (m.lower() + " " + str(label_by_model[m]).lower())]
+
         st.radio(
             "Select a model",
             options=options,
@@ -221,7 +234,7 @@ def _set_selected_model():
             format_func=lambda m: label_by_model.get(m, m),
             on_change=_set_selected_model
         )
-
+        
     with st.expander("Report New Abnormality / Finding"):
         rep_model = st.text_input("Model number", key="rep_model")
         up_station = st.text_input("Station / Process")
@@ -354,6 +367,7 @@ if st.session_state.get("edit_id") == rid:
 
 else:
     st.info("Type a model number above to view history.")
+
 
 
 
