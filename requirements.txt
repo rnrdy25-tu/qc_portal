@@ -1,7 +1,7 @@
 streamlit
 pandas
-pillow
-matplotlib
+Pillow
 requests
-# optional: enable if you add the QR banner feature
-# qrcode[pil]
+openpyxl>=3.1
+# only if you need to import legacy .xls files:
+xlrd==1.2.0
