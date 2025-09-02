@@ -15,6 +15,11 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 
+# --- Safety defaults for taxonomy (used by edit/delete UI) ---
+STAGES = globals().get("STAGES", ["IQC", "IPQC", "FQC", "OQC", "ATE", "Packing"])
+STATION_LIST = globals().get("STATION_LIST", [])
+CATEGORIES = globals().get("CATEGORIES", [{"code": "OTHER", "name": "Other (describe)", "group": "Other"}])
+
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "data"
 IMG_DIR = DATA_DIR / "images"
@@ -356,5 +361,6 @@ if st.session_state.get("edit_id") == rid:
 
 else:
     st.info("Type a model number above to view history.")
+
 
 
