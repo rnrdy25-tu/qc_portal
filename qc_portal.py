@@ -548,8 +548,7 @@ if sel:
                 st.error("Please enter a model number")
 
     # Models (Folders tree)
-   
-    with st.expander("Models"):
+with st.expander("Models"):
     # 1) Load data
     mdf = list_models()
     fdf = list_folders()
@@ -557,11 +556,13 @@ if sel:
     # 2) Folder manager
     st.markdown("**Folders**")
     cfa, cfb, cfc = st.columns([2, 2, 1])
+
     with cfa:
         new_folder = st.text_input("New folder name", key="new_folder_name")
         if st.button("➕ Create folder"):
             add_folder(new_folder)
             st.success("Folder created")
+
     with cfb:
         existing = [""] + (fdf["name"].tolist() if not fdf.empty else [])
         old_name = st.selectbox("Rename folder", existing, key="old_folder_sel")
@@ -570,6 +571,7 @@ if sel:
             if old_name:
                 err = rename_folder(old_name, new_name)
                 st.success("Renamed") if not err else st.error(err)
+
     with cfc:
         del_name = st.selectbox("Delete", (fdf["name"].tolist() if not fdf.empty else []), key="del_folder_sel")
         if st.button("🗑️ Delete folder"):
@@ -581,7 +583,7 @@ if sel:
     # 3) Filter models and build mdf_v safely
     filt = st.text_input("Filter models", "", key="models_filter_sidebar")
     mdf_v = mdf.copy()
-    if "bucket" not in mdf_v.columns:   # safety if cache held an old schema
+    if "bucket" not in mdf_v.columns:
         mdf_v["bucket"] = ""
     if "customer" not in mdf_v.columns:
         mdf_v["customer"] = ""
@@ -595,7 +597,7 @@ if sel:
             )
         ]
 
-    # 4) Build full folder list (deduped) including Unassigned and empty folders
+    # 4) Build full folder list (deduped)
     seen = set()
     folder_names = []
     for b in mdf_v["bucket"].fillna("").tolist():
@@ -616,7 +618,7 @@ if sel:
                 st.session_state["rep_model"] = picked
         return _cb
 
-    # 5) Tree UI: one expander per folder (unique radio key)
+    # 5) Tree UI (unique radio key)
     for i, folder in enumerate(folder_names):
         st.markdown("")  # spacer
         tag = folder if folder != "Unassigned" else "Unassigned (no folder)"
@@ -635,7 +637,7 @@ if sel:
                                    (f'  ({r["customer"]})' if r["customer"] else "")
                     for _, r in sub.iterrows()
                 }
-                radio_key = f"folder_pick_{i}"  # UNIQUE per row
+                radio_key = f"folder_pick_{i}"
                 st.radio(
                     "Select a model",
                     options=options,
@@ -644,7 +646,7 @@ if sel:
                     on_change=make_on_pick(radio_key),
                 )
 
-    # 6) Manage selected model (still in sidebar, unique keys)
+    # 6) Manage selected model (still in sidebar)
     sel = st.session_state.get("search_model") or st.session_state.get("model_pick")
     if sel:
         st.markdown("---")
@@ -1067,6 +1069,7 @@ if query:
 
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
 
 
