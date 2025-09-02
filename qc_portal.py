@@ -548,6 +548,7 @@ if sel:
                 st.error("Please enter a model number")
 
     # Models (Folders tree)
+   
     with st.expander("Models"):
     # 1) Load data
     mdf = list_models()
@@ -1066,6 +1067,7 @@ if query:
 
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
 
 
