@@ -165,25 +165,61 @@ def load_findings(model_no: str, days: int | None = None):
 
 def init_db():
     with get_conn() as c:
+        # Create/upgrade MODELS
         c.execute(SCHEMA_MODELS)
-        # add missing columns for models (safe migration)
-cols = {row[1] for row in c.execute("PRAGMA table_info(models)").fetchall()}
-if "customer" not in cols:
-    c.execute("ALTER TABLE models ADD COLUMN customer TEXT")
-if "bucket" not in cols:
-    c.execute("ALTER TABLE models ADD COLUMN bucket TEXT")
+        # Safe migration for older DBs: add columns if missing
+        mcols = {row[1] for row in c.execute("PRAGMA table_info(models)").fetchall()}
+        if "customer" not in mcols:
+            c.execute("ALTER TABLE models ADD COLUMN customer TEXT")
+        if "bucket" not in mcols:
+            c.execute("ALTER TABLE models ADD COLUMN bucket TEXT")
+
+        # Create/upgrade FINDINGS
         c.execute(SCHEMA_FINDINGS)
-        # Add missing columns on the fly (safe migrations)
-        existing = {row[1] for row in c.execute("PRAGMA table_info(findings)").fetchall()}
-        expected = [ln.split()[0] for ln in SCHEMA_FINDINGS.split("(")[1].split(")")[0].split(",") if ln.strip() and not ln.strip().startswith("--")]
-        for coldef in [ln.strip() for ln in SCHEMA_FINDINGS.splitlines() if ln.strip() and not ln.strip().startswith("--")]:
-            if "CREATE TABLE" in coldef or coldef.startswith(")"):
-                continue
-            parts = coldef.replace(",", "").split()
-            col = parts[0]
-            typ = parts[1] if len(parts) > 1 else "TEXT"
-            if col not in existing:
+        # Safe migration for older DBs: add columns if missing
+        fcols = {row[1] for row in c.execute("PRAGMA table_info(findings)").fetchall()}
+        add_cols = {
+            # operator fields
+            "line": "TEXT",
+            "shift": "TEXT",
+            "nonconformity_category": "TEXT",
+            "defective_qty": "INTEGER",
+            "inspection_qty": "INTEGER",
+            "lot_qty": "INTEGER",
+            "stock_or_wip": "TEXT",
+            "discovery_dept": "TEXT",
+            "source": "TEXT",
+            "outflow_stage": "TEXT",
+            "defect_group": "TEXT",
+            "defect_item": "TEXT",
+            "mo_po": "TEXT",
+            # QA/CAPA
+            "need_capa": "INTEGER",
+            "capa_date": "TEXT",
+            "capa_no": "TEXT",
+            "customer_or_supplier": "TEXT",
+            "judgment": "TEXT",
+            "responsibility_unit": "TEXT",
+            "unit_head": "TEXT",
+            "owner": "TEXT",
+            "root_cause": "TEXT",
+            "corrective_action": "TEXT",
+            "reply_date": "TEXT",
+            "days_to_reply": "INTEGER",
+            "delay_days": "INTEGER",
+            "reply_closed": "INTEGER",
+            "results_closed": "INTEGER",
+            "results_tracking_unit": "TEXT",
+            "occurrences": "INTEGER",
+            "remark": "TEXT",
+            "detection": "INTEGER",
+            "severity": "INTEGER",
+            "occurrence": "INTEGER",
+        }
+        for col, typ in add_cols.items():
+            if col not in fcols:
                 c.execute(f"ALTER TABLE findings ADD COLUMN {col} {typ}")
+
         c.commit()
 
 init_db()
@@ -846,6 +882,7 @@ if query:
                                 st.rerun()
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
 
 
