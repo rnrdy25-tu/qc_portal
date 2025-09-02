@@ -526,33 +526,58 @@ with st.sidebar:
                 mdf_v.apply(lambda r: s in (r["model_no"] + " " + r["name"] + " " + r["customer"] + " " + r["bucket"]).lower(), axis=1)
             ]
 
-        # Build full folder list including Unassigned and empty folders
-        folder_names = ["Unassigned"] + sorted(set(mdf_v["bucket"].dropna().replace("", "Unassigned").tolist()))
-        for n in (fdf["name"].tolist() if not fdf.empty else []):
-            if n not in folder_names:
-                folder_names.append(n)
+       # --- Build full folder list (deduped) including Unassigned and empty folders
+seen = set()
+folder_names = []
 
-        def make_on_pick(key):
-            def _cb():
-                picked = st.session_state.get(key)
-                if picked:
-                    st.session_state["search_model"] = picked
-                    st.session_state["rep_model"] = picked
-            return _cb
+# From models
+for b in mdf_v["bucket"].fillna(""):
+    name = b.strip() if b and b.strip() else "Unassigned"
+    if name not in seen:
+        folder_names.append(name)
+        seen.add(name)
 
-        # Tree: one expander per folder
-        for folder in folder_names:
-            st.markdown("")  # spacer
-            tag = folder if folder != "Unassigned" else "Unassigned (no folder)"
-            with st.expander(f"📁 {tag}"):
-                sub = mdf_v[(mdf_v["bucket"].replace("", "Unassigned") == folder)] if folder != "Unassigned" else mdf_v[mdf_v["bucket"].fillna("").eq("")]
-                if sub.empty:
-                    st.caption("No models here yet.")
-                else:
-                    options = sub["model_no"].tolist()
-                    label_map = {r["model_no"]: f'{r["name"] or r["model_no"]}  •  {r["model_no"]}' + (f'  ({r["customer"]})' if r["customer"] else "") for _, r in sub.iterrows()}
-                    key = f"pick_{folder}"
-                    st.radio("Select a model", options=options, key=key, format_func=lambda m: label_map.get(m, m), on_change=make_on_pick(key))
+# From folders table (so empty folders show up)
+for n in (fdf["name"].tolist() if not fdf.empty else []):
+    if n not in seen:
+        folder_names.append(n)
+        seen.add(n)
+
+def make_on_pick(key):
+    def _cb():
+        picked = st.session_state.get(key)
+        if picked:
+            st.session_state["search_model"] = picked
+            st.session_state["rep_model"] = picked
+    return _cb
+
+# --- Tree UI: one expander per folder (unique radio key per row)
+for i, folder in enumerate(folder_names):
+    st.markdown("")  # spacer
+    tag = folder if folder != "Unassigned" else "Unassigned (no folder)"
+    with st.expander(f"📁 {tag}"):
+        if folder == "Unassigned":
+            sub = mdf_v[mdf_v["bucket"].fillna("").eq("")]
+        else:
+            sub = mdf_v[mdf_v["bucket"].fillna("").eq(folder)]
+
+        if sub.empty:
+            st.caption("No models here yet.")
+        else:
+            options = sub["model_no"].tolist()
+            label_map = {
+                r["model_no"]: f'{r["name"] or r["model_no"]}  •  {r["model_no"]}' +
+                               (f'  ({r["customer"]})' if r["customer"] else "")
+                for _, r in sub.iterrows()
+            }
+            radio_key = f"folder_pick_{i}"   # UNIQUE key
+            st.radio(
+                "Select a model",
+                options=options,
+                key=radio_key,
+                format_func=lambda m: label_map.get(m, m),
+                on_change=make_on_pick(radio_key),
+            )
 
         # Manage selected model
         sel = st.session_state.get("search_model") or st.session_state.get("model_pick")
@@ -908,3 +933,4 @@ if query:
 
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
