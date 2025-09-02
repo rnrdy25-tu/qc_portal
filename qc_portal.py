@@ -549,32 +549,148 @@ if sel:
 
     # Models (Folders tree)
     with st.expander("Models"):
-        mdf = list_models()
-        fdf = list_folders()
+    # 1) Load data
+    mdf = list_models()
+    fdf = list_folders()
 
-        # Folder manager
-        st.markdown("**Folders**")
-        cfa, cfb, cfc = st.columns([2, 2, 1])
-        with cfa:
-            new_folder = st.text_input("New folder name", key="new_folder_name")
-            if st.button("➕ Create folder"):
-                add_folder(new_folder)
-                st.success("Folder created")
-        with cfb:
-            existing = [""] + (fdf["name"].tolist() if not fdf.empty else [])
-            old_name = st.selectbox("Rename folder", existing, key="old_folder_sel")
-            new_name = st.text_input("→ New name", key="new_folder_newname")
-            if st.button("✏️ Rename folder"):
-                if old_name:
-                    err = rename_folder(old_name, new_name)
-                    st.success("Renamed") if not err else st.error(err)
-        with cfc:
-            del_name = st.selectbox("Delete", (fdf["name"].tolist() if not fdf.empty else []), key="del_folder_sel")
-            if st.button("🗑️ Delete folder"):
-                err = delete_folder(del_name)
-                st.success("Folder deleted") if not err else st.error(err)
+    # 2) Folder manager
+    st.markdown("**Folders**")
+    cfa, cfb, cfc = st.columns([2, 2, 1])
+    with cfa:
+        new_folder = st.text_input("New folder name", key="new_folder_name")
+        if st.button("➕ Create folder"):
+            add_folder(new_folder)
+            st.success("Folder created")
+    with cfb:
+        existing = [""] + (fdf["name"].tolist() if not fdf.empty else [])
+        old_name = st.selectbox("Rename folder", existing, key="old_folder_sel")
+        new_name = st.text_input("→ New name", key="new_folder_newname")
+        if st.button("✏️ Rename folder"):
+            if old_name:
+                err = rename_folder(old_name, new_name)
+                st.success("Renamed") if not err else st.error(err)
+    with cfc:
+        del_name = st.selectbox("Delete", (fdf["name"].tolist() if not fdf.empty else []), key="del_folder_sel")
+        if st.button("🗑️ Delete folder"):
+            err = delete_folder(del_name)
+            st.success("Folder deleted") if not err else st.error(err)
 
+    st.markdown("---")
+
+    # 3) Filter models and build mdf_v safely
+    filt = st.text_input("Filter models", "", key="models_filter_sidebar")
+    mdf_v = mdf.copy()
+    if "bucket" not in mdf_v.columns:   # safety if cache held an old schema
+        mdf_v["bucket"] = ""
+    if "customer" not in mdf_v.columns:
+        mdf_v["customer"] = ""
+
+    if filt.strip():
+        s = filt.lower().strip()
+        mdf_v = mdf_v[
+            mdf_v.apply(
+                lambda r: s in (f"{r['model_no']} {r['name']} {r['customer']} {r['bucket']}".lower()),
+                axis=1,
+            )
+        ]
+
+    # 4) Build full folder list (deduped) including Unassigned and empty folders
+    seen = set()
+    folder_names = []
+    for b in mdf_v["bucket"].fillna("").tolist():
+        name = b.strip() if b and b.strip() else "Unassigned"
+        if name not in seen:
+            folder_names.append(name)
+            seen.add(name)
+    for n in (fdf["name"].tolist() if not fdf.empty else []):
+        if n not in seen:
+            folder_names.append(n)
+            seen.add(n)
+
+    def make_on_pick(key):
+        def _cb():
+            picked = st.session_state.get(key)
+            if picked:
+                st.session_state["search_model"] = picked
+                st.session_state["rep_model"] = picked
+        return _cb
+
+    # 5) Tree UI: one expander per folder (unique radio key)
+    for i, folder in enumerate(folder_names):
+        st.markdown("")  # spacer
+        tag = folder if folder != "Unassigned" else "Unassigned (no folder)"
+        with st.expander(f"📁 {tag}"):
+            if folder == "Unassigned":
+                sub = mdf_v[mdf_v["bucket"].fillna("").eq("")]
+            else:
+                sub = mdf_v[mdf_v["bucket"].fillna("").eq(folder)]
+
+            if sub.empty:
+                st.caption("No models here yet.")
+            else:
+                options = sub["model_no"].tolist()
+                label_map = {
+                    r["model_no"]: f'{r["name"] or r["model_no"]}  •  {r["model_no"]}' +
+                                   (f'  ({r["customer"]})' if r["customer"] else "")
+                    for _, r in sub.iterrows()
+                }
+                radio_key = f"folder_pick_{i}"  # UNIQUE per row
+                st.radio(
+                    "Select a model",
+                    options=options,
+                    key=radio_key,
+                    format_func=lambda m: label_map.get(m, m),
+                    on_change=make_on_pick(radio_key),
+                )
+
+    # 6) Manage selected model (still in sidebar, unique keys)
+    sel = st.session_state.get("search_model") or st.session_state.get("model_pick")
+    if sel:
         st.markdown("---")
+        st.subheader("Manage selected model")
+        row = mdf[mdf["model_no"] == sel]
+        row = row.iloc[0] if not row.empty else None
+
+        name_val = st.text_input("Display name", value=(row["name"] if row is not None else ""), key=f"mgr_name_{sel}")
+        customer_val = st.text_input("Customer", value=(row["customer"] if row is not None else ""), key=f"mgr_customer_{sel}")
+        folder_choices = [""] + (fdf["name"].tolist() if not fdf.empty else [])
+        current_folder = row["bucket"] if row is not None else ""
+        folder_sel = st.selectbox(
+            "Folder",
+            folder_choices,
+            index=(folder_choices.index(current_folder) if current_folder in folder_choices else 0),
+            key=f"mgr_folder_{sel}",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Save name/customer/folder", key=f"mgr_save_{sel}"):
+                update_model_meta(sel, name_val, customer_val, folder_sel)
+                st.success("Saved.")
+                list_models.clear()
+        with c2:
+            new_no = st.text_input("Rename model number", value=sel, key=f"mgr_rename_{sel}")
+            if st.button("✏️ Rename model number", key=f"mgr_btn_rename_{sel}"):
+                err = rename_model(sel, new_no, move_images=True)
+                if err:
+                    st.error(err)
+                else:
+                    st.success(f"Renamed {sel} → {new_no}")
+                    st.session_state["search_model"] = new_no
+                    st.session_state["rep_model"] = new_no
+                    st.rerun()
+
+        st.markdown("#### Danger zone")
+        del_find = st.checkbox("Also delete all findings (DB)", value=True, key=f"mgr_del_find_{sel}")
+        del_imgs = st.checkbox("Also delete image files", value=False, key=f"mgr_del_imgs_{sel}")
+        del_crit = st.checkbox("Also delete criteria (DB)", value=False, key=f"mgr_del_crit_{sel}")
+        if st.button("🗑️ Delete this model", key=f"mgr_btn_delete_{sel}"):
+            delete_model_all(sel, delete_images=del_imgs, delete_findings=del_find, delete_criteria=del_crit)
+            st.success(f"Deleted model {sel}")
+            st.session_state.pop("search_model", None)
+            st.session_state.pop("model_pick", None)
+            st.session_state.pop("rep_model", None)
+            st.rerun()
 
         # Filter models
         filt = st.text_input("Filter models", "", key="models_filter_sidebar")
@@ -950,5 +1066,6 @@ if query:
 
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
 
 
