@@ -130,6 +130,49 @@ def upsert_model(model_no: str, name: str = ""):
     with get_conn() as c:
         c.execute("INSERT INTO models(model_no, name) VALUES(?, ?) ON CONFLICT(model_no) DO UPDATE SET name=excluded.name", (model_no.strip(), name.strip()))
         c.commit()
+# ---------- management helpers (edit/delete) ----------
+
+def get_finding(fid: int):
+    with get_conn() as c:
+        df = pd.read_sql_query("SELECT * FROM findings WHERE id=?", c, params=(fid,))
+        return df.to_dict("records")[0] if not df.empty else None
+
+def update_finding(fid: int, payload: dict):
+    if not payload:
+        return
+    fields = list(payload.keys())
+    sets = ", ".join([f"{k}=?" for k in fields])
+    values = [payload[k] for k in fields] + [fid]
+    with get_conn() as c:
+        c.execute(f"UPDATE findings SET {sets} WHERE id=?", values)
+        c.commit()
+
+def delete_finding(fid: int, delete_images: bool = False):
+    image_path = None
+    extra_json = None
+    with get_conn() as c:
+        row = c.execute("SELECT image_path, extra FROM findings WHERE id=?", (fid,)).fetchone()
+        if not row:
+            return
+        image_path, extra_json = row
+        c.execute("DELETE FROM findings WHERE id=?", (fid,))
+        c.commit()
+    if delete_images:
+        paths = []
+        if image_path:
+            paths.append(DATA_DIR / str(image_path))
+        try:
+            j = json.loads(extra_json or "{}")
+            for rel in j.get("images", []):
+                paths.append(DATA_DIR / str(rel))
+        except Exception:
+            pass
+        for p in paths:
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
 
 # ---------- UI ----------
 st.set_page_config(page_title="QC Portal", layout="wide")
@@ -235,6 +278,83 @@ if query:
                     st.markdown(f"**{r['category']}** · {r['station']}  ")
                     st.caption(f"{r['created_at']} · Reporter: {r['reporter']}")
                     st.write(r["description"])
+
+# --- Manage buttons ---
+rid = int(r["id"])
+b1, b2 = st.columns([1,1])
+with b1:
+    if st.button("✏️ Edit", key=f"edit_{rid}"):
+        st.session_state["edit_id"] = rid
+with b2:
+    if st.button("🗑️ Delete", key=f"del_{rid}"):
+        st.session_state[f"confirm_del_{rid}"] = True
+
+# Delete confirm
+if st.session_state.get(f"confirm_del_{rid}"):
+    with st.expander("Confirm delete?", expanded=True):
+        del_imgs = st.checkbox("Also delete image files", value=False, key=f"delimgs_{rid}")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Yes, delete", key=f"yesdel_{rid}"):
+                delete_finding(rid, delete_images=del_imgs)
+                st.session_state.pop(f"confirm_del_{rid}", None)
+                load_findings.clear()
+                st.rerun()
+        with c2:
+            if st.button("Cancel", key=f"canceldel_{rid}"):
+                st.session_state.pop(f"confirm_del_{rid}", None)
+
+# Edit form
+if st.session_state.get("edit_id") == rid:
+    with st.form(key=f"edit_form_{rid}", clear_on_submit=False):
+        e_stage = st.selectbox("Stage", STAGES, index=(STAGES.index(r['stage']) if r.get('stage') in STAGES else 0), key=f"e_stage_{rid}")
+        station_choices = [""] + STATION_LIST if STATION_LIST else ["DIP-A","DIP-B","DIP-C","SMT","ATE","Packing","Repair","AOI","SPI"]
+        try:
+            idx_station = ([""] + STATION_LIST).index(r.get('station','')) if STATION_LIST else station_choices.index(r.get('station',''))
+        except ValueError:
+            idx_station = 0
+        e_station = st.selectbox("Station", station_choices, index=idx_station, key=f"e_station_{rid}")
+        e_line = st.text_input("Line", value=str(r.get('line','')), key=f"e_line_{rid}")
+        e_shift = st.text_input("Shift", value=str(r.get('shift','')), key=f"e_shift_{rid}")
+
+        cat_names = [f"{c['name']} ({c['code']})" for c in CATEGORIES]
+        try:
+            default_idx = next(i for i,c in enumerate(CATEGORIES) if c['code'] == str(r.get('defect_code','')))
+        except StopIteration:
+            default_idx = 0
+        e_cat_sel = st.selectbox("Category", cat_names, index=default_idx, key=f"e_cat_{rid}")
+        _cat_obj = CATEGORIES[cat_names.index(e_cat_sel)]
+        e_category = _cat_obj['name']
+        e_defcode = _cat_obj['code']
+
+        sev_choices = ["Minor","Major","Critical"]
+        try:
+            idx_sev = sev_choices.index(r.get('severity','Major'))
+        except ValueError:
+            idx_sev = 1
+        e_sev = st.selectbox("Severity", sev_choices, index=idx_sev, key=f"e_sev_{rid}")
+
+        e_mo = st.text_input("MO No.", value=str(r.get('mo_no','')), key=f"e_mo_{rid}")
+        e_lot = st.text_input("Lot/Batch", value=str(r.get('lot_no','')), key=f"e_lot_{rid}")
+        e_sn = st.text_input("SN / Barcode", value=str(r.get('sn','')), key=f"e_sn_{rid}")
+        e_reporter = st.text_input("Reporter", value=str(r.get('reporter','')), key=f"e_reporter_{rid}")
+        e_desc = st.text_area("Description", value=str(r.get('description','')), key=f"e_desc_{rid}")
+
+        submitted = st.form_submit_button("Save changes")
+        if submitted:
+            payload = {
+                "stage": e_stage, "station": e_station, "line": e_line, "shift": e_shift,
+                "category": e_category, "defect_code": e_defcode, "severity": e_sev,
+                "mo_no": e_mo, "lot_no": e_lot, "sn": e_sn, "reporter": e_reporter,
+                "description": e_desc
+            }
+            update_finding(rid, payload)
+            st.success("Updated")
+            st.session_state.pop("edit_id", None)
+            load_findings.clear()
+            st.rerun()
+
 else:
     st.info("Type a model number above to view history.")
+
 
