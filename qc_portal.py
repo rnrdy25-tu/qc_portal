@@ -1,4 +1,4 @@
-# qc\_portal.py — Full rewrite (folders tree, model management, history, edit/delete,
+F# qc\_portal.py — Full rewrite (folders tree, model management, history, edit/delete,
 
 # Excel/CSV import, Teams/Flow hooks, no duplicate Streamlit keys)
 
@@ -20,7 +20,7 @@ import requests
 
 # ---------------------------- Paths & setup ----------------------------
 
-APP\_DIR = Path(**file**).parent.resolve()
+APP\_DIR = Path(__file__).parent.resolve()
 DATA\_DIR = APP\_DIR / "data"
 IMG\_DIR = DATA\_DIR / "images"
 CFG\_DIR = APP\_DIR / "config"
@@ -991,3 +991,4 @@ else:
 
 else:
 st.info(f"Type a model number above to view history.  |  LAN: http\://{LAN\_IP}:8501")
+
