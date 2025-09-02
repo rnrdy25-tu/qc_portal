@@ -344,7 +344,6 @@ def _set_selected_model():
     if picked:
         st.session_state["search_model"] = picked
         st.session_state["rep_model"] = picked
-        st.rerun()
 
 # Sidebar
 with st.sidebar:
@@ -698,3 +697,4 @@ if query:
                                 st.rerun()
 else:
     st.info(f"Type a model number above to view history.  |  LAN: http://{LAN_IP}:8501")
+
