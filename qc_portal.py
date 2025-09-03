@@ -341,85 +341,145 @@ def page_search():
     banner()
     st.subheader("Search & Export")
 
+    # ---------- Build Customer/Supplier option list (from both tables) ----------
+    cs_opts = set()
+    with conn() as c:
+        # From first_piece table
+        rows = c.execute(
+            "SELECT DISTINCT customer_supplier FROM first_piece "
+            "WHERE customer_supplier IS NOT NULL AND TRIM(customer_supplier) <> ''"
+        ).fetchall()
+        cs_opts.update([r[0] for r in rows if r and r[0]])
+
+        # From nc.extra JSON (best-effort)
+        rows = c.execute(
+            "SELECT extra FROM nc WHERE extra IS NOT NULL AND TRIM(extra) <> '' LIMIT 2000"
+        ).fetchall()
+    for (ex,) in rows:
+        try:
+            d = json.loads(ex)
+            v = str(d.get("customer_supplier", "")).strip()
+            if v:
+                cs_opts.add(v)
+        except Exception:
+            pass
+
+    cs_list = ["(any)"] + sorted(cs_opts)
+
+    # ---------- Filters UI ----------
     st.markdown("##### Filters")
-    f1,f2,f3,f4,f5 = st.columns([1,1,1,1,1.2])
-    model  = f1.text_input("Model contains")
-    vers   = f2.text_input("Version contains")
-    sn     = f3.text_input("SN contains")
-    mo     = f4.text_input("MO contains")
-    textin = f5.text_input("Text in description/reporter/type/extra")
+    frow1 = st.columns([1, 1, 1, 1, 1.2])
+    model  = frow1[0].text_input("Model contains")
+    vers   = frow1[1].text_input("Version contains")
+    sn     = frow1[2].text_input("SN contains")
+    mo     = frow1[3].text_input("MO contains")
+    textin = frow1[4].text_input("Text in description/reporter/type/extra")
 
-    df1, df2 = None, None
-    if st.button("Search", type="primary"):
-        # First piece
-        q  = "SELECT * FROM first_piece WHERE 1=1"
-        pa = []
-        for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo),
-                        ("customer_supplier", textin)):
-            if val:
-                q += f" AND {col} LIKE ?"; pa.append(f"%{val}%")
-        q += " ORDER BY id DESC LIMIT 100"
-        with conn() as c:
-            df1 = pd.read_sql_query(q, c, params=pa)
+    frow2 = st.columns([1, 1, 2])
+    cs_pick = frow2[0].selectbox("Customer / Supplier", cs_list)
+    scope   = frow2[1].selectbox("Search scope", ["Both", "First Piece only", "Non-Conformity only"])
+    limit   = frow2[2].slider("Max records per section", 20, 300, 100, step=20)
 
-        # NC
-        qn, pn = "SELECT * FROM nc WHERE 1=1", []
-        for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
-            if val:
-                qn += f" AND {col} LIKE ?"; pn.append(f"%{val}%")
-        if textin:
-            qn += " AND (description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)"
-            pn += [f"%{textin}%"]*4
-        qn += " ORDER BY id DESC LIMIT 100"
-        with conn() as c:
-            df2 = pd.read_sql_query(qn, c, params=pn)
+    run = st.button("Search", type="primary")
 
-        st.toast("Loaded results.")
+    df_fp, df_nc = None, None
+    if run:
+        # ---------- FIRST PIECE ----------
+        if scope in ("Both", "First Piece only"):
+            q  = "SELECT * FROM first_piece WHERE 1=1"
+            pa = []
+            for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
+                if val:
+                    q += f" AND {col} LIKE ?"; pa.append(f"%{val}%")
+            if cs_pick and cs_pick != "(any)":
+                q += " AND customer_supplier = ?"; pa.append(cs_pick)
+            q += f" ORDER BY id DESC LIMIT {int(limit)}"
+            with conn() as c:
+                df_fp = pd.read_sql_query(q, c, params=pa)
 
-    # results UI
-    if df1 is not None:
-        with st.expander(f"First Piece results ({len(df1)})", expanded=True):
-            for _,r in df1.iterrows():
+        # ---------- NON-CONFORMITY ----------
+        if scope in ("Both", "Non-Conformity only"):
+            qn, pn = "SELECT * FROM nc WHERE 1=1", []
+            for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
+                if val:
+                    qn += f" AND {col} LIKE ?"; pn.append(f"%{val}%")
+            if textin:
+                qn += " AND (description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)"
+                pn += [f"%{textin}%"]*4
+            qn += f" ORDER BY id DESC LIMIT {int(limit*2)}"   # grab a bit more for client-side CS filter
+            with conn() as c:
+                df_nc = pd.read_sql_query(qn, c, params=pn)
+
+            # Apply Customer/Supplier filter from extra JSON client-side
+            if df_nc is not None and not df_nc.empty and cs_pick != "(any)":
+                def ex_cs(row):
+                    try:
+                        return (json.loads(row["extra"] or "{}").get("customer_supplier") or "").strip()
+                    except Exception:
+                        return ""
+                df_nc = df_nc.copy()
+                df_nc["__cs__"] = df_nc.apply(ex_cs, axis=1)
+                df_nc = df_nc[df_nc["__cs__"] == cs_pick].drop(columns=["__cs__"])
+                # Keep limit after filtering
+                df_nc = df_nc.head(limit)
+
+        st.toast("Search complete.")
+
+    # ---------- Render FIRST PIECE ----------
+    if df_fp is not None:
+        exp_main = st.expander(f"First Piece results ({len(df_fp)})", expanded=True)
+        with exp_main:
+            for _,r in df_fp.iterrows():
                 with st.container(border=True):
                     cols = st.columns([1,1,4])
                     p_top = ROOT / str(r["img_top"]) if r["img_top"] else None
                     p_bot = ROOT / str(r["img_bottom"]) if r["img_bottom"] else None
                     with cols[0]:
-                        if p_top and p_top.exists(): st.image(str(p_top), width=180, caption="TOP", output_format="JPEG")
+                        if p_top and p_top.exists(): st.image(str(p_top), width=160, caption="TOP", output_format="JPEG")
                     with cols[1]:
-                        if p_bot and p_bot.exists(): st.image(str(p_bot), width=180, caption="BOTTOM", output_format="JPEG")
+                        if p_bot and p_bot.exists(): st.image(str(p_bot), width=160, caption="BOTTOM", output_format="JPEG")
                     with cols[2]:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} "
-                            f"&nbsp;|&nbsp; **Version:** {r['model_version'] or '-'} "
-                            f"&nbsp;|&nbsp; **SN:** {r['sn'] or '-'} "
-                            f"&nbsp;|&nbsp; **MO:** {r['mo'] or '-'}")
-                        st.caption(f"🕒 {r['created_at']}  •  🧑‍💼 Reporter: {r['reporter']}  "
-                                   f"•  🏷 Dept: {r['department'] or '-'}  •  👥 Customer/Supplier: {r['customer_supplier'] or '-'}")
-            with st.expander("Table view & export"):
-                st.dataframe(df1, use_container_width=True, hide_index=True)
-                st.download_button("Download First-Piece CSV", df1.to_csv(index=False).encode("utf-8"),
-                                   "firstpiece_export.csv", "text/csv")
+                            f"| **Version:** {r['model_version'] or '-'} "
+                            f"| **SN:** {r['sn'] or '-'} "
+                            f"| **MO:** {r['mo'] or '-'}"
+                        )
+                        st.caption(
+                            f"🕒 {r['created_at']}  ·  🧑‍💼 Reporter: {r['reporter']}  "
+                            f"·  🏷 Dept: {r['department'] or '-'}  ·  👥 Customer/Supplier: {r['customer_supplier'] or '-'}"
+                        )
 
-    if df2 is not None:
-        with st.expander(f"Non-Conformity results ({len(df2)})", expanded=True):
-            for _,r in df2.iterrows():
+        # IMPORTANT: the "Table view" expander is OUTSIDE the results expander (no nesting)
+        exp_tbl = st.expander("First Piece — Table view & export", expanded=False)
+        with exp_tbl:
+            st.dataframe(df_fp, use_container_width=True, hide_index=True)
+            st.download_button("Download First-Piece CSV",
+                               df_fp.to_csv(index=False).encode("utf-8"),
+                               "firstpiece_export.csv", "text/csv")
+
+    # ---------- Render NON-CONFORMITY ----------
+    if df_nc is not None:
+        exp_main = st.expander(f"Non-Conformity results ({len(df_nc)})", expanded=True)
+        with exp_main:
+            for _,r in df_nc.iterrows():
                 with st.container(border=True):
                     c1,c2 = st.columns([1,4])
                     p = ROOT / str(r["img"]) if r["img"] else None
                     with c1:
-                        if p and p.exists(): st.image(str(p), width=180, output_format="JPEG", caption="")
+                        if p and p.exists(): st.image(str(p), width=160, output_format="JPEG")
                     with c2:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
-                            f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}")
-                        st.caption(f"🕒 {r['created_at']}  •  🧑‍💼 Reporter: {r['reporter']}  •  🏷 Category: {r['severity']}")
+                            f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
+                        )
+                        st.caption(f"🕒 {r['created_at']}  ·  🧑‍💼 Reporter: {r['reporter']}  ·  🏷 Category: {r['severity']}")
                         if r["description"]:
                             st.write(r["description"])
+                        # compact extra
                         try:
                             extra = json.loads(r["extra"] or "{}")
                             if extra:
-                                # show compact chips
                                 line = "  ".join([f"**{k.replace('_',' ')}:** {v}" for k,v in extra.items() if str(v).strip()])
                                 st.markdown(line)
                         except Exception:
@@ -430,10 +490,14 @@ def page_search():
                                     c.execute("DELETE FROM nc WHERE id=?", (int(r["id"]),))
                                     c.commit()
                                 st.success("Deleted."); st.rerun()
-            with st.expander("Table view & export"):
-                st.dataframe(df2, use_container_width=True, hide_index=True)
-                st.download_button("Download NC CSV", df2.to_csv(index=False).encode("utf-8"),
-                                   "nc_export.csv", "text/csv")
+
+        # Again, table expander OUTSIDE the results expander
+        exp_tbl = st.expander("Non-Conformity — Table view & export", expanded=False)
+        with exp_tbl:
+            st.dataframe(df_nc, use_container_width=True, hide_index=True)
+            st.download_button("Download NC CSV",
+                               df_nc.to_csv(index=False).encode("utf-8"),
+                               "nc_export.csv", "text/csv")
 
 # --------------------------------------------------------------------------------------
 # Import CSV page (safe – requires click)
@@ -610,3 +674,4 @@ def router():
     footer_nav()
 
 router()
+
