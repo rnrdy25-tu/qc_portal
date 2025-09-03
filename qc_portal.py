@@ -121,6 +121,47 @@ def can_delete_modify() -> bool:
     u = current_user()
     return u and (u["role"] in ("Admin", "QA"))
 
+from datetime import datetime
+import textwrap
+
+def _parse_date_safe(s: str) -> str | None:
+    if not s:
+        return None
+    s = str(s).strip()
+    # Try a few common formats (add more if you need)
+    fmts = ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"]
+    for f in fmts:
+        try:
+            return datetime.strptime(s, f).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # last resort: try letting pandas parse if you already use it
+    try:
+        return pd.to_datetime(s, errors="coerce").strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def display_date_for_row(row: dict) -> str:
+    """
+    Prefer the CSV's event date (extra.event_date) if present,
+    otherwise fall back to created_at.
+    """
+    extra = {}
+    try:
+        extra = json.loads(row.get("extra") or "{}")
+    except Exception:
+        pass
+
+    event_date = extra.get("event_date") or row.get("date")  # tolerate top-level 'date'
+    event_date = _parse_date_safe(event_date)
+    if event_date:
+        return event_date
+    # fallback: created_at (already iso)
+    created = row.get("created_at")
+    if created and isinstance(created, str) and len(created) >= 10:
+        return created[:10]
+    return ""
+
 # --------------------------- UI helpers ------------------------------------ #
 def brand_banner():
     st.markdown("""
@@ -158,6 +199,22 @@ def save_image(rel_subdir: str, uploaded_file) -> str:
     out_path = folder / f"{ts}_{safe_name}"
     Image.open(uploaded_file).convert("RGB").save(out_path, format="JPEG", quality=90)
     return str(out_path.relative_to(ROOT))
+
+def bottom_nav():
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("🏠 Home", use_container_width=True):
+            st.session_state["page"] = "HOME"
+            st.rerun()
+    with c2:
+        if st.button("👤 Personal", use_container_width=True):
+            st.session_state["page"] = "PROFILE"
+            st.rerun()
+    with c3:
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
 
 # --------------------------- Pages ----------------------------------------- #
 def page_login():
@@ -666,20 +723,36 @@ def page_users():
 
 # --------------------------- Router ---------------------------------------- #
 def router():
-    page = st.session_state.get("page","LOGIN")
-    if page == "LOGIN":   page_login()
-    elif page == "HOME":  page_home()
-    elif page == "FP":    page_fp_create()
-    elif page == "NC":    page_nc_create()
-    elif page == "SEARCH":page_search()
-    elif page == "IMPORT":page_import()
-    elif page == "PROFILE":page_profile()
-    elif page == "USERS": page_users()
+    page = st.session_state.get("page", "LOGIN")
+
+    if page == "LOGIN":
+        page_login()
+        return
+
+    if page == "HOME":
+        page_home()
+    elif page == "FP":
+        page_fp_create()
+    elif page == "NC":
+        page_nc_create()
+    elif page == "SEARCH":
+        page_search()
+    elif page == "IMPORT":
+        page_import()
+    elif page == "PROFILE":
+        page_profile()
+    elif page == "USERS":
+        page_users()
     else:
-        st.session_state.page="HOME"; st.rerun()
+        st.session_state["page"] = "HOME"
+        st.rerun()
+
+    # ⬇️ add this so the nav appears on all non-login pages
+    bottom_nav()
 
 # --------------------------- Boot ------------------------------------------ #
 if __name__ == "__main__":
     init_db()
     if "page" not in st.session_state: st.session_state["page"] = "LOGIN"
     router()
+
