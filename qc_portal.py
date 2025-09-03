@@ -339,46 +339,59 @@ def page_nc():
 # --------------------------------------------------------------------------------------
 def page_search():
     banner()
-    st.subheader("Search & Export")
+    st.subheader("Search & View")
 
-    # ---------- Build Customer/Supplier option list (from both tables) ----------
+    # ---------- Build Customer/Supplier options from both tables ----------
     cs_opts = set()
     with conn() as c:
-        # From first_piece table
+        # From first_piece
         rows = c.execute(
             "SELECT DISTINCT customer_supplier FROM first_piece "
             "WHERE customer_supplier IS NOT NULL AND TRIM(customer_supplier) <> ''"
         ).fetchall()
         cs_opts.update([r[0] for r in rows if r and r[0]])
 
-        # From nc.extra JSON (best-effort)
+        # From nc.extra JSON
         rows = c.execute(
             "SELECT extra FROM nc WHERE extra IS NOT NULL AND TRIM(extra) <> '' LIMIT 2000"
         ).fetchall()
     for (ex,) in rows:
         try:
-            d = json.loads(ex)
-            v = str(d.get("customer_supplier", "")).strip()
+            v = str(json.loads(ex).get("customer_supplier", "")).strip()
             if v:
                 cs_opts.add(v)
         except Exception:
             pass
-
     cs_list = ["(any)"] + sorted(cs_opts)
 
     # ---------- Filters UI ----------
     st.markdown("##### Filters")
-    frow1 = st.columns([1, 1, 1, 1, 1.2])
-    model  = frow1[0].text_input("Model contains")
-    vers   = frow1[1].text_input("Version contains")
-    sn     = frow1[2].text_input("SN contains")
-    mo     = frow1[3].text_input("MO contains")
-    textin = frow1[4].text_input("Text in description/reporter/type/extra")
+    r1 = st.columns([1, 1, 1, 1, 1.2])
+    model  = r1[0].text_input("Model contains")
+    vers   = r1[1].text_input("Version contains")
+    sn     = r1[2].text_input("SN contains")
+    mo     = r1[3].text_input("MO contains")
+    textin = r1[4].text_input("Text in description/reporter/type/extra")
 
-    frow2 = st.columns([1, 1, 2])
-    cs_pick = frow2[0].selectbox("Customer / Supplier", cs_list)
-    scope   = frow2[1].selectbox("Search scope", ["Both", "First Piece only", "Non-Conformity only"])
-    limit   = frow2[2].slider("Max records per section", 20, 300, 100, step=20)
+    r2 = st.columns([1.2, 1.2, 1, 2])
+    cs_pick = r2[0].selectbox("Customer / Supplier", cs_list)
+    scope   = r2[1].selectbox("Search scope", ["Both", "First Piece only", "Non-Conformity only"])
+    limit   = r2[2].slider("Max records per section", 20, 300, 100, step=20)
+
+    # Date range (optional)
+    use_date = st.checkbox("Filter by Date (created_at)", value=True)
+    if use_date:
+        dcol = st.columns([1, 1, 6])
+        start_d = dcol[0].date_input("From", date.today() - timedelta(days=30))
+        end_d   = dcol[1].date_input("To",   date.today())
+        # Ensure ordering
+        if start_d > end_d:
+            start_d, end_d = end_d, start_d
+        # convert to strings 'YYYY-MM-DD' to compare in SQLite
+        start_s = start_d.strftime("%Y-%m-%d")
+        end_s   = end_d.strftime("%Y-%m-%d")
+    else:
+        start_s = end_s = None
 
     run = st.button("Search", type="primary")
 
@@ -393,6 +406,10 @@ def page_search():
                     q += f" AND {col} LIKE ?"; pa.append(f"%{val}%")
             if cs_pick and cs_pick != "(any)":
                 q += " AND customer_supplier = ?"; pa.append(cs_pick)
+            if use_date and start_s and end_s:
+                # created_at is ISO; compare DATE portion only
+                q += " AND date(substr(created_at,1,10)) BETWEEN ? AND ?"
+                pa += [start_s, end_s]
             q += f" ORDER BY id DESC LIMIT {int(limit)}"
             with conn() as c:
                 df_fp = pd.read_sql_query(q, c, params=pa)
@@ -406,82 +423,87 @@ def page_search():
             if textin:
                 qn += " AND (description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)"
                 pn += [f"%{textin}%"]*4
-            qn += f" ORDER BY id DESC LIMIT {int(limit*2)}"   # grab a bit more for client-side CS filter
+            if use_date and start_s and end_s:
+                qn += " AND date(substr(created_at,1,10)) BETWEEN ? AND ?"
+                pn += [start_s, end_s]
+
+            qn += f" ORDER BY id DESC LIMIT {int(limit*2)}"  # get more, we may filter by CS next
             with conn() as c:
                 df_nc = pd.read_sql_query(qn, c, params=pn)
 
-            # Apply Customer/Supplier filter from extra JSON client-side
+            # Customer/Supplier filter from JSON extra (client-side)
             if df_nc is not None and not df_nc.empty and cs_pick != "(any)":
                 def ex_cs(row):
                     try:
-                        return (json.loads(row["extra"] or "{}").get("customer_supplier") or "").strip()
+                        return (json.loads(row.get("extra") or "{}").get("customer_supplier") or "").strip()
                     except Exception:
                         return ""
                 df_nc = df_nc.copy()
                 df_nc["__cs__"] = df_nc.apply(ex_cs, axis=1)
                 df_nc = df_nc[df_nc["__cs__"] == cs_pick].drop(columns=["__cs__"])
-                # Keep limit after filtering
                 df_nc = df_nc.head(limit)
 
         st.toast("Search complete.")
 
     # ---------- Render FIRST PIECE ----------
     if df_fp is not None:
-        exp_main = st.expander(f"First Piece results ({len(df_fp)})", expanded=True)
-        with exp_main:
-            for _,r in df_fp.iterrows():
+        exp = st.expander(f"First Piece results ({len(df_fp)})", expanded=True)
+        with exp:
+            for _, r in df_fp.iterrows():
                 with st.container(border=True):
-                    cols = st.columns([1,1,4])
+                    c0, c1, c2 = st.columns([1, 1, 4])
                     p_top = ROOT / str(r["img_top"]) if r["img_top"] else None
                     p_bot = ROOT / str(r["img_bottom"]) if r["img_bottom"] else None
-                    with cols[0]:
-                        if p_top and p_top.exists(): st.image(str(p_top), width=160, caption="TOP", output_format="JPEG")
-                    with cols[1]:
-                        if p_bot and p_bot.exists(): st.image(str(p_bot), width=160, caption="BOTTOM", output_format="JPEG")
-                    with cols[2]:
-                        st.markdown(
-                            f"**Model:** {r['model_no'] or '-'} "
-                            f"| **Version:** {r['model_version'] or '-'} "
-                            f"| **SN:** {r['sn'] or '-'} "
-                            f"| **MO:** {r['mo'] or '-'}"
-                        )
-                        st.caption(
-                            f"🕒 {r['created_at']}  ·  🧑‍💼 Reporter: {r['reporter']}  "
-                            f"·  🏷 Dept: {r['department'] or '-'}  ·  👥 Customer/Supplier: {r['customer_supplier'] or '-'}"
-                        )
-
-        # IMPORTANT: the "Table view" expander is OUTSIDE the results expander (no nesting)
-        exp_tbl = st.expander("First Piece — Table view & export", expanded=False)
-        with exp_tbl:
-            st.dataframe(df_fp, use_container_width=True, hide_index=True)
-            st.download_button("Download First-Piece CSV",
-                               df_fp.to_csv(index=False).encode("utf-8"),
-                               "firstpiece_export.csv", "text/csv")
-
-    # ---------- Render NON-CONFORMITY ----------
-    if df_nc is not None:
-        exp_main = st.expander(f"Non-Conformity results ({len(df_nc)})", expanded=True)
-        with exp_main:
-            for _,r in df_nc.iterrows():
-                with st.container(border=True):
-                    c1,c2 = st.columns([1,4])
-                    p = ROOT / str(r["img"]) if r["img"] else None
+                    with c0:
+                        if p_top and p_top.exists():
+                            st.image(str(p_top), width=160, caption="TOP", output_format="JPEG")
                     with c1:
-                        if p and p.exists(): st.image(str(p), width=160, output_format="JPEG")
+                        if p_bot and p_bot.exists():
+                            st.image(str(p_bot), width=160, caption="BOTTOM", output_format="JPEG")
                     with c2:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
                             f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
                         )
+                        st.caption(
+                            f"🕒 {r['created_at']}  ·  🧑‍💼 Reporter: {r['reporter']} "
+                            f"·  🏷 Dept: {r.get('department') or '-'}  ·  👥 Customer/Supplier: {r.get('customer_supplier') or '-'}"
+                        )
+
+        exp_tbl = st.expander("First Piece — Table view & export")
+        with exp_tbl:
+            st.dataframe(df_fp, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download First-Piece CSV",
+                df_fp.to_csv(index=False).encode("utf-8"),
+                "firstpiece_export.csv", "text/csv"
+            )
+
+    # ---------- Render NON-CONFORMITY ----------
+    if df_nc is not None:
+        exp = st.expander(f"Non-Conformity results ({len(df_nc)})", expanded=True)
+        with exp:
+            for _, r in df_nc.iterrows():
+                with st.container(border=True):
+                    c0, c1 = st.columns([1, 4])
+                    p = ROOT / str(r["img"]) if r["img"] else None
+                    with c0:
+                        if p and p.exists():
+                            st.image(str(p), width=160, output_format="JPEG")
+                    with c1:
+                        st.markdown(
+                            f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
+                            f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
+                        )
                         st.caption(f"🕒 {r['created_at']}  ·  🧑‍💼 Reporter: {r['reporter']}  ·  🏷 Category: {r['severity']}")
-                        if r["description"]:
+                        if r.get("description"):
                             st.write(r["description"])
-                        # compact extra
+                        # compact extra row
                         try:
-                            extra = json.loads(r["extra"] or "{}")
+                            extra = json.loads(r.get("extra") or "{}")
                             if extra:
-                                line = "  ".join([f"**{k.replace('_',' ')}:** {v}" for k,v in extra.items() if str(v).strip()])
-                                st.markdown(line)
+                                compact = "  ".join([f"**{k.replace('_',' ')}:** {v}" for k, v in extra.items() if str(v).strip()])
+                                st.markdown(compact)
                         except Exception:
                             pass
                         if can_delete_modify():
@@ -491,13 +513,14 @@ def page_search():
                                     c.commit()
                                 st.success("Deleted."); st.rerun()
 
-        # Again, table expander OUTSIDE the results expander
-        exp_tbl = st.expander("Non-Conformity — Table view & export", expanded=False)
+        exp_tbl = st.expander("Non-Conformity — Table view & export")
         with exp_tbl:
             st.dataframe(df_nc, use_container_width=True, hide_index=True)
-            st.download_button("Download NC CSV",
-                               df_nc.to_csv(index=False).encode("utf-8"),
-                               "nc_export.csv", "text/csv")
+            st.download_button(
+                "Download NC CSV",
+                df_nc.to_csv(index=False).encode("utf-8"),
+                "nc_export.csv", "text/csv"
+            )
 
 # --------------------------------------------------------------------------------------
 # Import CSV page (safe – requires click)
@@ -674,4 +697,5 @@ def router():
     footer_nav()
 
 router()
+
 
