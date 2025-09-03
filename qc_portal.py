@@ -1,22 +1,21 @@
-# Quality Management Portal — complete Streamlit app
-# --------------------------------------------------
-# What’s inside:
-# - Login with roles (Admin/QA/QC)
-# - Home menu (banner + tiles + bottom nav)
+# Quality Management Portal — Streamlit app (full)
+# -------------------------------------------------------------------
+# Features:
+# - Login (Admin/QA/QC) + User setup (Admin)
+# - Home menu (banner + big tiles + bottom nav)
 # - First Piece create (dept, customer/supplier, TOP/BOTTOM photos)
-# - Create Non-Conformity (layout matching your sheet, photo optional)
-# - Search & View (date range + filters + compact cards + optional exports)
-#   • For NC, shows the sheet’s event date (not the import time)
+# - Create NC (sheet-like layout, photo optional)
+# - Search & View: date range + filters + compact cards + exports
+#   • NC cards show the sheet event date (not import time)
 #   • Filter by Customer/Supplier (auto-collected options)
-# - Import CSV/Excel (Browse → Preview → Import; no auto import)
+# - Import CSV/Excel: Browse → Preview → Import (no auto import)
 # - Personal page (change password)
-# - User setup (Admin only)
 #
 # Storage:
-#   DB   : /mount/data/qm_portal.sqlite3 (if writable) else /tmp/qc_portal/qm_portal.sqlite3
+#   DB    : /mount/data/qm_portal.sqlite3 (if writable else /tmp/qc_portal/…)
 #   Photos: ROOT/images/...
 
-import os, io, json, sqlite3, hashlib
+import os, io, json, hashlib, sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -24,167 +23,122 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 
-# --------------------------- Storage (cloud-safe) --------------------------- #
-def pick_data_dir() -> Path:
-    for root in (Path("/mount/data"), Path("/tmp/qc_portal")):
+# --------------------------- Cloud-safe storage ---------------------------- #
+def _data_root() -> Path:
+    for p in (Path("/mount/data"), Path("/tmp/qc_portal")):
         try:
-            root.mkdir(parents=True, exist_ok=True)
-            (root / ".ok").write_text("ok", encoding="utf-8")
-            return root
+            p.mkdir(parents=True, exist_ok=True)
+            (p / ".ok").write_text("ok", encoding="utf-8")
+            return p
         except Exception:
             pass
-    raise RuntimeError("No writable directory found")
+    raise RuntimeError("No writable directory available")
 
-ROOT = pick_data_dir()
-IMG_DIR = ROOT / "images"
-IMG_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = ROOT / "qm_portal.sqlite3"
+ROOT   = _data_root()
+IMGDIR = ROOT / "images"
+IMGDIR.mkdir(parents=True, exist_ok=True)
+DB     = ROOT / "qm_portal.sqlite3"
 
-# --------------------------- DB & schema ----------------------------------- #
-def conn():
-    return sqlite3.connect(DB_PATH)
+# --------------------------- DB ------------------------------------------- #
+def db():
+    return sqlite3.connect(DB)
 
 SCHEMA = [
-    # users
-    """
-    CREATE TABLE IF NOT EXISTS users(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE,
-      pass_hash TEXT,
-      display_name TEXT,
-      role TEXT CHECK(role in ('Admin','QA','QC')) NOT NULL
-    );
-    """,
-    # first piece
-    """
-    CREATE TABLE IF NOT EXISTS first_piece(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      created_at TEXT,
-      model_no TEXT,
-      model_version TEXT,
-      sn TEXT,
-      mo TEXT,
-      department TEXT,
-      customer_supplier TEXT,
-      notes TEXT,
-      img_top TEXT,
-      img_bottom TEXT,
-      reporter TEXT
-    );
-    """,
-    # non-conformity
-    """
-    CREATE TABLE IF NOT EXISTS nc(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      created_at TEXT,
-      model_no TEXT,
-      model_version TEXT,
-      sn TEXT,
-      mo TEXT,
-      description TEXT,
-      severity TEXT,
-      reporter TEXT,
-      img TEXT,
-      extra TEXT
-    );
-    """,
+    """CREATE TABLE IF NOT EXISTS users(
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         username TEXT UNIQUE, pass_hash TEXT, display_name TEXT,
+         role TEXT CHECK(role in ('Admin','QA','QC')) NOT NULL
+       )""",
+    """CREATE TABLE IF NOT EXISTS first_piece(
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         created_at TEXT,
+         model_no TEXT, model_version TEXT, sn TEXT, mo TEXT,
+         department TEXT, customer_supplier TEXT,
+         notes TEXT, img_top TEXT, img_bottom TEXT,
+         reporter TEXT
+       )""",
+    """CREATE TABLE IF NOT EXISTS nc(
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         created_at TEXT,
+         model_no TEXT, model_version TEXT, sn TEXT, mo TEXT,
+         description TEXT, severity TEXT, reporter TEXT,
+         img TEXT, extra TEXT
+       )""",
 ]
 
 def init_db():
-    with conn() as c:
+    with db() as c:
         for s in SCHEMA: c.execute(s)
-        # default Admin
+        # Seed admin
         cur = c.execute("SELECT COUNT(*) FROM users WHERE username='Admin'")
         if cur.fetchone()[0] == 0:
-            h = hash_pwd("admin1234")
-            c.execute(
-                "INSERT INTO users(username,pass_hash,display_name,role) VALUES(?,?,?,?)",
-                ("Admin", h, "Admin", "Admin")
-            )
+            c.execute("INSERT INTO users(username,pass_hash,display_name,role) VALUES(?,?,?,?)",
+                      ("Admin", hash_pwd("admin1234"), "Admin", "Admin"))
         c.commit()
 
-# --------------------------- Auth utils ------------------------------------ #
-def hash_pwd(pwd: str) -> str:
-    return hashlib.sha256(("qmportal::" + pwd).encode("utf-8")).hexdigest()
+# --------------------------- Auth ----------------------------------------- #
+def hash_pwd(p: str) -> str:
+    return hashlib.sha256(("qmportal::" + p).encode("utf-8")).hexdigest()
 
 def get_user(username: str):
-    with conn() as c:
-        r = c.execute("SELECT id,username,pass_hash,display_name,role FROM users WHERE username=?",
-                      (username,)).fetchone()
-        if r:
-            return {"id": r[0], "username": r[1], "pass_hash": r[2], "display_name": r[3], "role": r[4]}
-    return None
+    with db() as c:
+        r = c.execute("""SELECT id,username,pass_hash,display_name,role
+                         FROM users WHERE username=?""", (username,)).fetchone()
+    if not r: return None
+    return {"id": r[0], "username": r[1], "pass_hash": r[2],
+            "display_name": r[3], "role": r[4]}
 
-def current_user():
-    return st.session_state.get("user")
-
+def me(): return st.session_state.get("user")
 def require_login():
     if "user" not in st.session_state:
-        st.session_state["page"] = "LOGIN"
-        st.rerun()
+        st.session_state["page"] = "LOGIN"; st.rerun()
+def can_edit_delete():  # Admin or QA
+    u = me(); return u and u["role"] in ("Admin", "QA")
 
-def can_delete_modify() -> bool:
-    u = current_user()
-    return u and (u["role"] in ("Admin", "QA"))
+# --------------------------- Helpers -------------------------------------- #
+def save_img(subfolder: str, up) -> str:
+    """Save uploaded image and return relative path."""
+    folder = IMGDIR / subfolder
+    folder.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    safe = (up.name or "img").replace(" ", "_")
+    out  = folder / f"{ts}_{safe}"
+    Image.open(up).convert("RGB").save(out, "JPEG", quality=92, subsampling=0)
+    return str(out.relative_to(ROOT))
 
-# --------------------------- Date helpers ---------------------------------- #
-def _parse_date_safe(s: str) -> str | None:
-    """Normalize a variety of date strings to 'YYYY-MM-DD' or return None."""
-    if s is None: return None
-    s = str(s).strip()
-    if not s: return None
-    fmts = [
-        "%Y-%m-%d", "%Y/%m/%d",
-        "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M",
-        "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"
-    ]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    try:
-        v = pd.to_datetime(s, errors="coerce")
-        if pd.notna(v): return str(v.date())
-    except Exception:
-        pass
-    return None
-
-def nc_event_date_for_row(row: dict) -> str:
-    """Prefer CSV sheet event date (extra.created_date or Date); fallback to created_at."""
-    extra = {}
+def evt_date_from_row(row: dict) -> str:
+    """For NC: prefer sheet date from extra.created_date (or Date) else created_at."""
     try:
         extra = json.loads(row.get("extra") or "{}")
     except Exception:
-        pass
-    event_date = extra.get("created_date") or row.get("date")
-    event_date = _parse_date_safe(event_date)
-    if event_date: return event_date
-    created = row.get("created_at")
-    if created and isinstance(created, str) and len(created) >= 10:
-        return created[:10]
-    return ""
+        extra = {}
+    raw = extra.get("created_date") or row.get("date")
+    if raw:
+        try:
+            return str(pd.to_datetime(raw, errors="coerce").date())
+        except Exception:
+            pass
+    ca = row.get("created_at") or ""
+    return ca[:10]
 
-# --------------------------- UI helpers ------------------------------------ #
-def brand_banner():
+def banner():
     st.markdown("""
     <style>
-      .banner{background:linear-gradient(120deg,#e9f3ff 0%,#f7fbff 100%);
+      .banner{background:linear-gradient(120deg,#eaf2ff 0%,#f8fbff 100%);
               padding:14px 18px;border-radius:16px;border:1px solid #e9eef5;margin-bottom:14px}
       .brandrow{display:flex;align-items:center;gap:14px}
-      .brandrow .logo{font-size:32px}
-      .brandrow .title{font-size:18px;font-weight:700;color:#1b2b59;line-height:1.2}
+      .brandrow .logo{font-size:30px}
+      .brandrow .title{font-size:18px;font-weight:800;color:#1b2b59}
       .sub{font-size:13px;color:#4a5b88}
       .tiles .stButton>button{height:120px;border-radius:18px;border:1px solid #edf0f6;
               box-shadow:0 1px 6px rgba(0,0,0,.05);font-weight:700}
-      .tiles .stButton>button:hover{border-color:#9cc5ff;box-shadow:0 6px 16px rgba(0,0,0,.08)}
-      .card_extra{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
-      .chip{background:#f6f8ff;border:1px solid #e8ecfd;color:#2c3b69;
-            padding:4px 8px;border-radius:12px;font-size:12px}
+      .tiles .stButton>button:hover{border-color:#9cc5ff;box-shadow:0 6px 16px rgba(0,0,0,.09)}
+      .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+      .chip{background:#f6f8ff;border:1px solid #e8ecfd;color:#2c3b69;padding:4px 8px;border-radius:12px;font-size:12px}
     </style>
     """, unsafe_allow_html=True)
-    u = current_user()
-    disp = u["display_name"] if u else "-"
+    user = me()
+    disp = user["display_name"] if user else "-"
     st.markdown(f"""
       <div class="banner">
         <div class="brandrow">
@@ -198,292 +152,221 @@ def brand_banner():
       </div>
     """, unsafe_allow_html=True)
 
-def save_image(rel_subdir: str, uploaded_file) -> str:
-    """Save PIL image under images/<subdir>/... return path relative to ROOT."""
-    folder = IMG_DIR / rel_subdir
-    folder.mkdir(parents=True, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    safe_name = uploaded_file.name.replace(" ", "_")
-    out_path = folder / f"{ts}_{safe_name}"
-    Image.open(uploaded_file).convert("RGB").save(out_path, format="JPEG", quality=90)
-    return str(out_path.relative_to(ROOT))
-
 def bottom_nav():
     st.divider()
-    c1, c2, c3 = st.columns(3)
+    c1,c2,c3 = st.columns(3)
+    if c1.button("🏠 Home", key="bn_home", use_container_width=True):
+        st.session_state["page"] = "HOME"; st.rerun()
+    if c2.button("👤 Personal", key="bn_me", use_container_width=True):
+        st.session_state["page"] = "PROFILE"; st.rerun()
+    if c3.button("🚪 Logout", key="bn_out", use_container_width=True):
+        st.session_state.clear(); st.rerun()
 
-    with c1:
-        if st.button("🏠 Home", key="nav_home", use_container_width=True):
-            st.session_state["page"] = "HOME"
-            st.rerun()
-
-    with c2:
-        if st.button("👤 Personal", key="nav_personal", use_container_width=True):
-            st.session_state["page"] = "PROFILE"
-            st.rerun()
-
-    with c3:
-        if st.button("🚪 Logout", key="nav_logout", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
-
-# --------------------------- Pages ----------------------------------------- #
+# --------------------------- Pages ---------------------------------------- #
 def page_login():
     st.set_page_config(page_title="Quality Management Portal", layout="wide")
-    st.markdown("""
-    <div style="text-align:center;margin-top:10vh">
-      <h2>🔐 Quality Management Portal</h2>
-      <p style="color:#566;">Please sign in to continue.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    with st.form("login", clear_on_submit=False):
-        username = st.text_input("User")
-        pwd = st.text_input("Password", type="password")
-        col = st.columns([1,1,2])
-        ok = col[0].form_submit_button("Login", type="primary", use_container_width=True)
-        col[1].form_submit_button("Clear", use_container_width=True)
+    st.markdown("<h2 style='text-align:center;margin-top:8vh'>🔐 Quality Management Portal</h2>", unsafe_allow_html=True)
+    with st.form("login"):
+        u = st.text_input("User")
+        p = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Login", type="primary")
         if ok:
-            u = get_user(username.strip())
-            if u and u["pass_hash"] == hash_pwd(pwd):
-                st.session_state["user"] = u
+            user = get_user(u.strip())
+            if user and user["pass_hash"] == hash_pwd(p):
+                st.session_state["user"] = user
                 st.session_state["page"] = "HOME"
-                st.success("Welcome!"); st.experimental_rerun()
-            else:
-                st.error("Invalid credentials.")
+                st.success("Welcome!"); st.rerun()
+            st.error("Invalid credentials.")
 
 def page_home():
-    require_login()
-    brand_banner()
+    require_login(); banner()
     st.markdown("### Main Menu")
     st.markdown('<div class="tiles">', unsafe_allow_html=True)
-    cols = st.columns(3, gap="large")
-    if cols[0].button("📷 First Piece", use_container_width=True): st.session_state.page="FP"; st.rerun()
-    if cols[1].button("🧩 Create NC", use_container_width=True): st.session_state.page="NC"; st.rerun()
-    if cols[2].button("🔎 Search & View", use_container_width=True): st.session_state.page="SEARCH"; st.rerun()
-    cols2 = st.columns(3, gap="large")
-    if cols2[0].button("⬆️ Import CSV/Excel", use_container_width=True): st.session_state.page="IMPORT"; st.rerun()
-    if cols2[1].button("👤 Personal", use_container_width=True): st.session_state.page="PROFILE"; st.rerun()
-    admin = current_user()["role"] == "Admin"
-    if cols2[2].button("⚙️ User Setup", use_container_width=True, disabled=not admin):
+    r1 = st.columns(3, gap="large")
+    if r1[0].button("📷 First Piece", use_container_width=True): st.session_state.page="FP"; st.rerun()
+    if r1[1].button("🧩 Create NC", use_container_width=True): st.session_state.page="NC"; st.rerun()
+    if r1[2].button("🔎 Search & View", use_container_width=True): st.session_state.page="SEARCH"; st.rerun()
+    r2 = st.columns(3, gap="large")
+    if r2[0].button("⬆️ Import CSV/Excel", use_container_width=True): st.session_state.page="IMPORT"; st.rerun()
+    if r2[1].button("👤 Personal", use_container_width=True): st.session_state.page="PROFILE"; st.rerun()
+    admin = me()["role"] == "Admin"
+    if r2[2].button("⚙️ User Setup", use_container_width=True, disabled=not admin):
         st.session_state.page="USERS"; st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
 def page_fp_create():
-    require_login()
-    brand_banner()
+    require_login(); banner()
     st.subheader("📷 First Piece — Create")
     with st.form("fp_form", clear_on_submit=True):
         c1,c2,c3 = st.columns(3)
         model_no = c1.text_input("Model (short)")
-        sn = c2.text_input("SN / Barcode")
-        department = c3.text_input("Department")
+        sn       = c2.text_input("SN / Barcode")
+        dept     = c3.text_input("Department")
         c4,c5,c6 = st.columns(3)
-        model_version = c4.text_input("Model Version")
-        mo = c5.text_input("MO / Work Order")
-        customer_supplier = c6.text_input("Customer / Supplier")
-        notes = st.text_area("Notes / Description")
+        version  = c4.text_input("Model Version")
+        mo       = c5.text_input("MO / Work Order")
+        cs       = c6.text_input("Customer / Supplier")
+        notes    = st.text_area("Notes / Description")
 
         st.markdown("**TOP image**")
-        up_top = st.file_uploader("Upload TOP photo", type=["jpg","jpeg","png"], key="fp_top")
+        up_top    = st.file_uploader("Upload TOP photo", type=["jpg","jpeg","png"], key="fp_top")
         st.markdown("**BOTTOM image**")
         up_bottom = st.file_uploader("Upload BOTTOM photo", type=["jpg","jpeg","png"], key="fp_bottom")
 
-        ok = st.form_submit_button("Save first piece", type="primary")
-        if ok:
+        if st.form_submit_button("Save first piece", type="primary"):
             if not model_no.strip():
                 st.error("Model is required.")
             else:
-                img_top = save_image(f"firstpiece/{model_no}", up_top) if up_top else None
-                img_bottom = save_image(f"firstpiece/{model_no}", up_bottom) if up_bottom else None
-                with conn() as c:
-                    c.execute("""
-                        INSERT INTO first_piece(created_at,model_no,model_version,sn,mo,department,
-                                                customer_supplier,notes,img_top,img_bottom,reporter)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        datetime.utcnow().isoformat(),
-                        model_no.strip(),
-                        model_version.strip(),
-                        sn.strip(),
-                        mo.strip(),
-                        department.strip(),
-                        customer_supplier.strip(),
-                        notes.strip(),
-                        img_top, img_bottom,
-                        current_user()["display_name"],
-                    ))
+                p_top = save_img(f"firstpiece/{model_no}", up_top) if up_top else None
+                p_bot = save_img(f"firstpiece/{model_no}", up_bottom) if up_bottom else None
+                with db() as c:
+                    c.execute("""INSERT INTO first_piece(created_at,model_no,model_version,sn,mo,
+                                department,customer_supplier,notes,img_top,img_bottom,reporter)
+                                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                              (datetime.utcnow().isoformat(), model_no.strip(), version.strip(), sn.strip(),
+                               mo.strip(), dept.strip(), cs.strip(), notes.strip(), p_top, p_bot,
+                               me()["display_name"]))
                     c.commit()
                 st.success("First piece saved.")
 
 def page_nc_create():
-    require_login()
-    brand_banner()
+    require_login(); banner()
     st.subheader("🧩 Create Non-Conformity")
-
-    # Form fields in the order matching your sheet
     with st.form("nc_form", clear_on_submit=True):
         c1,c2,c3,c4 = st.columns(4)
-        model_no      = c1.text_input("Model")
-        model_version = c2.text_input("Model Version")
-        sn            = c3.text_input("SN / Barcode")
-        mo            = c4.text_input("MO / Work Order")
+        model       = c1.text_input("Model")
+        version     = c2.text_input("Model Version")
+        sn          = c3.text_input("SN / Barcode")
+        mo          = c4.text_input("MO / Work Order")
 
-        severity      = st.text_input("Nonconformity (category, e.g. Minor/Major/Critical)")
-        description   = st.text_area("Description of Nonconformity")
+        severity    = st.text_input("Nonconformity (category)")
+        descr       = st.text_area("Description of Nonconformity")
 
         c5,c6,c7,c8 = st.columns(4)
-        customer_supplier = c5.text_input("Customer/Supplier")
-        line              = c6.text_input("Line")
-        work_station      = c7.text_input("Work Station")
-        unit_head         = c8.text_input("Unit Head")
+        cs          = c5.text_input("Customer/Supplier")
+        line        = c6.text_input("Line")
+        ws          = c7.text_input("Work Station")
+        head        = c8.text_input("Unit Head")
 
-        c9,c10,c11 = st.columns(3)
-        responsibility   = c9.text_input("Responsibility")
-        root_cause       = c10.text_input("Root Cause")
-        corrective_action= c11.text_input("Corrective Action")
+        c9,c10,c11  = st.columns(3)
+        resp        = c9.text_input("Responsibility")
+        root        = c10.text_input("Root Cause")
+        ca          = c11.text_input("Corrective Action")
 
         c12,c13,c14 = st.columns(3)
-        exception_reporters = c12.text_input("Exception reporters")
-        discovery           = c13.text_input("Discovery")
-        origin_sources      = c14.text_input("Origil Sources")
+        exc         = c12.text_input("Exception reporters")
+        disc        = c13.text_input("Discovery")
+        origin      = c14.text_input("Origil Sources")
 
         c15,c16,c17 = st.columns(3)
-        defective_item     = c15.text_input("Defective Item")
-        defective_item_2   = c16.text_input("Defective Item (2)")  # to cover duplicate column case
-        defective_outflow  = c17.text_input("Defective Outflow")
+        item1       = c15.text_input("Defective Item")
+        item2       = c16.text_input("Defective Item (2)")
+        outflow     = c17.text_input("Defective Outflow")
 
         c18,c19,c20 = st.columns(3)
-        defective_qty  = c18.text_input("Defective Qty")
-        inspection_qty = c19.text_input("Inspection Qty")
-        lot_qty        = c20.text_input("Lot Qty")
+        dqty        = c18.text_input("Defective Qty")
+        iqty        = c19.text_input("Inspection Qty")
+        lqty        = c20.text_input("Lot Qty")
 
-        up = st.file_uploader("Upload photo (optional)", type=["jpg","jpeg","png"], key="nc_photo")
+        photo = st.file_uploader("Upload photo (optional)", type=["jpg","jpeg","png"], key="nc_photo")
 
-        ok = st.form_submit_button("Save NC", type="primary")
-        if ok:
-            img = save_image(f"nc/{model_no or 'misc'}", up) if up else None
+        if st.form_submit_button("Save NC", type="primary"):
+            img = save_img(f"nc/{model or 'misc'}", photo) if photo else None
             extra = {
-                "customer_supplier": customer_supplier.strip(),
-                "line": line.strip(),
-                "work_station": work_station.strip(),
-                "unit_head": unit_head.strip(),
-                "responsibility": responsibility.strip(),
-                "root_cause": root_cause.strip(),
-                "corrective_action": corrective_action.strip(),
-                "exception_reporters": exception_reporters.strip(),
-                "discovery": discovery.strip(),
-                "origin_sources": origin_sources.strip(),
-                "defective_item": defective_item.strip(),
-                "defective_item_2": defective_item_2.strip(),
-                "defective_outflow": defective_outflow.strip(),
-                "defective_qty": defective_qty.strip(),
-                "inspection_qty": inspection_qty.strip(),
-                "lot_qty": lot_qty.strip(),
+                "customer_supplier": cs.strip(), "line": line.strip(),
+                "work_station": ws.strip(), "unit_head": head.strip(),
+                "responsibility": resp.strip(), "root_cause": root.strip(),
+                "corrective_action": ca.strip(), "exception_reporters": exc.strip(),
+                "discovery": disc.strip(), "origin_sources": origin.strip(),
+                "defective_item": item1.strip(), "defective_item_2": item2.strip(),
+                "defective_outflow": outflow.strip(), "defective_qty": dqty.strip(),
+                "inspection_qty": iqty.strip(), "lot_qty": lqty.strip()
             }
-            with conn() as c:
-                c.execute("""
-                    INSERT INTO nc(created_at,model_no,model_version,sn,mo,description,severity,
-                                   reporter,img,extra)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    datetime.utcnow().isoformat(),
-                    model_no.strip(), model_version.strip(), sn.strip(), mo.strip(),
-                    description.strip(), severity.strip(),
-                    current_user()["display_name"],
-                    img,
-                    json.dumps(extra, ensure_ascii=False),
-                ))
+            with db() as c:
+                c.execute("""INSERT INTO nc(created_at,model_no,model_version,sn,mo,description,severity,
+                              reporter,img,extra) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                          (datetime.utcnow().isoformat(), model.strip(), version.strip(), sn.strip(), mo.strip(),
+                           descr.strip(), severity.strip(), me()["display_name"], img,
+                           json.dumps(extra, ensure_ascii=False)))
                 c.commit()
             st.success("Non-Conformity saved.")
 
-def page_search():
-    require_login()
-    brand_banner()
-    st.subheader("🔎 Search & View")
-
-    # Build Customer/Supplier options
-    cs_opts = set()
-    with conn() as c:
-        cs_opts.update([r[0] for r in c.execute(
+def _cs_options() -> list[str]:
+    s = set()
+    with db() as c:
+        s.update(v for (v,) in c.execute(
             "SELECT DISTINCT customer_supplier FROM first_piece "
-            "WHERE customer_supplier IS NOT NULL AND TRIM(customer_supplier)<>''").fetchall()
-        ])
+            "WHERE customer_supplier IS NOT NULL AND TRIM(customer_supplier)<>''"
+        ).fetchall())
         for (ex,) in c.execute("SELECT extra FROM nc WHERE extra IS NOT NULL").fetchall():
             try:
-                cs = (json.loads(ex).get("customer_supplier") or "").strip()
-                if cs: cs_opts.add(cs)
+                v = (json.loads(ex).get("customer_supplier") or "").strip()
+                if v: s.add(v)
             except Exception:
                 pass
-    cs_list = ["(any)"] + sorted([x for x in cs_opts if x])
+    return ["(any)"] + sorted(x for x in s if x)
+
+def page_search():
+    require_login(); banner()
+    st.subheader("🔎 Search & View")
 
     # Filters
-    f1 = st.columns([1,1,1,1,1.5])
-    model = f1[0].text_input("Model contains")
-    vers  = f1[1].text_input("Version contains")
-    sn    = f1[2].text_input("SN contains")
-    mo    = f1[3].text_input("MO contains")
-    textin= f1[4].text_input("Text in description/reporter/type/extra")
+    f1 = st.columns([1,1,1,1,1.6])
+    m  = f1[0].text_input("Model contains")
+    v  = f1[1].text_input("Version contains")
+    s  = f1[2].text_input("SN contains")
+    mo = f1[3].text_input("MO contains")
+    t  = f1[4].text_input("Text in description/reporter/type/extra")
 
     f2 = st.columns([1.2,1.2,1,2])
-    cs_pick = f2[0].selectbox("Customer / Supplier", cs_list)
-    scope   = f2[1].selectbox("Scope", ["Both","First Piece only","Non-Conformity only"])
-    limit   = f2[2].slider("Max per section", 20, 300, 80, 20)
+    cs = f2[0].selectbox("Customer / Supplier", _cs_options())
+    scope = f2[1].selectbox("Scope", ["Both","First Piece only","Non-Conformity only"])
+    limit = f2[2].slider("Max per section", 20, 300, 80, 20)
 
     dcol = st.columns([1,1,4])
-    dt_from = dcol[0].date_input("From", value=date.today()-timedelta(days=30))
-    dt_to   = dcol[1].date_input("To",   value=date.today())
-    if dt_from > dt_to: dt_from, dt_to = dt_to, dt_from
-    ds, de = dt_from.strftime("%Y-%m-%d"), dt_to.strftime("%Y-%m-%d")
+    d_from = dcol[0].date_input("From", date.today()-timedelta(days=30))
+    d_to   = dcol[1].date_input("To", date.today())
+    if d_from > d_to: d_from, d_to = d_to, d_from
+    ds, de = d_from.strftime("%Y-%m-%d"), d_to.strftime("%Y-%m-%d")
 
-    run = st.button("Search", type="primary")
+    go = st.button("Search", type="primary")
 
-    df_fp, df_nc = None, None
-    if run:
-        # First piece
+    df_fp = df_nc = None
+    if go:
+        # First piece query by import date
         if scope in ("Both","First Piece only"):
-            q  = "SELECT * FROM first_piece WHERE date(substr(created_at,1,10)) BETWEEN ? AND ?"
-            pa = [ds,de]
-            for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
+            q, pa = "SELECT * FROM first_piece WHERE date(substr(created_at,1,10)) BETWEEN ? AND ?", [ds,de]
+            for col,val in (("model_no",m),("model_version",v),("sn",s),("mo",mo)):
                 if val: q += f" AND {col} LIKE ?"; pa.append(f"%{val}%")
-            if cs_pick != "(any)":
-                q += " AND customer_supplier=?"; pa.append(cs_pick)
+            if cs != "(any)": q += " AND customer_supplier=?"; pa.append(cs)
             q += f" ORDER BY id DESC LIMIT {int(limit)}"
-            with conn() as c: df_fp = pd.read_sql_query(q, c, params=pa)
+            with db() as c: df_fp = pd.read_sql_query(q, c, params=pa)
 
-        # NC (fetch broadly by import time, then refine by event date)
+        # NC: fetch broadly then filter by event date & CS
         if scope in ("Both","Non-Conformity only"):
-            qn, pn = "SELECT * FROM nc", []
-            filters = []
-            for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
-                if val: filters.append(f"{col} LIKE ?"); pn.append(f"%{val}%")
-            if textin:
-                filters.append("(description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)")
-                pn += [f"%{textin}%"]*4
-            if filters:
-                qn += " WHERE " + " AND ".join(filters)
-            qn += " ORDER BY id DESC"
-            with conn() as c: df_nc = pd.read_sql_query(qn, c, params=pn)
-
-            # refine by event-date range & CS in JSON
+            q, pa, flt = "SELECT * FROM nc", [], []
+            for col,val in (("model_no",m),("model_version",v),("sn",s),("mo",mo)):
+                if val: flt.append(f"{col} LIKE ?"); pa.append(f"%{val}%")
+            if t:
+                flt.append("(description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)")
+                pa += [f"%{t}%"]*4
+            if flt: q += " WHERE " + " AND ".join(flt)
+            q += " ORDER BY id DESC"
+            with db() as c: df_nc = pd.read_sql_query(q, c, params=pa)
             if df_nc is not None and not df_nc.empty:
                 df_nc = df_nc.copy()
-                def _evt(r):
-                    try: return nc_event_date_for_row(r)
-                    except Exception: return ""
-                df_nc["__evt__"] = df_nc.apply(_evt, axis=1)
-                mask_date = (df_nc["__evt__"] >= ds) & (df_nc["__evt__"] <= de)
-                df_nc = df_nc[mask_date]
-                if cs_pick != "(any)":
-                    def _cs(r):
+                df_nc["__evt__"] = df_nc.apply(evt_date_from_row, axis=1)
+                df_nc = df_nc[(df_nc["__evt__"]>=ds) & (df_nc["__evt__"]<=de)]
+                if cs != "(any)":
+                    def _jcs(r):
                         try: return (json.loads(r.get("extra") or "{}").get("customer_supplier") or "").strip()
                         except Exception: return ""
-                    df_nc["__cs__"] = df_nc.apply(_cs, axis=1)
-                    df_nc = df_nc[df_nc["__cs__"] == cs_pick]
+                    df_nc["__cs__"] = df_nc.apply(_jcs, axis=1)
+                    df_nc = df_nc[df_nc["__cs__"]==cs]
                 df_nc = df_nc.drop(columns=[c for c in ["__evt__","__cs__"] if c in df_nc.columns]).head(limit)
-
         st.toast("Search complete.")
 
-    # ----- Render First-Piece cards -----
+    # ---------- First Piece cards
     if df_fp is not None:
         st.markdown(f"#### First Piece results ({len(df_fp)})")
         if df_fp.empty:
@@ -491,14 +374,13 @@ def page_search():
         else:
             for _, r in df_fp.iterrows():
                 with st.container(border=True):
-                    left, mid, right = st.columns([1,1,4])
-                    p_top = ROOT/str(r["img_top"]) if r.get("img_top") else None
-                    p_bot = ROOT/str(r["img_bottom"]) if r.get("img_bottom") else None
-                    with left:
-                        if p_top and p_top.exists(): st.image(str(p_top), width=150, caption="TOP")
-                    with mid:
-                        if p_bot and p_bot.exists(): st.image(str(p_bot), width=150, caption="BOTTOM")
-                    with right:
+                    imgL, infoR = st.columns([2,5])
+                    with imgL:
+                        p_top = ROOT/str(r.get("img_top") or "")
+                        p_bot = ROOT/str(r.get("img_bottom") or "")
+                        if p_top.is_file(): st.image(str(p_top), width=320, caption="TOP")
+                        if p_bot.is_file(): st.image(str(p_bot), width=320, caption="BOTTOM")
+                    with infoR:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
                             f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
@@ -508,14 +390,17 @@ def page_search():
                             f"🏷 Dept: {r.get('department') or '-'} · 👥 {r.get('customer_supplier') or '-'}"
                         )
                         if r.get("notes"): st.write(r["notes"])
-            # export if results
-            st.download_button(
-                "Download First-Piece CSV",
-                df_fp.to_csv(index=False).encode("utf-8"),
-                "firstpiece_export.csv", "text/csv", use_container_width=True
-            )
+                        if can_edit_delete():
+                            if st.button("Delete", key=f"del_fp_{r['id']}"):
+                                with db() as c:
+                                    c.execute("DELETE FROM first_piece WHERE id=?", (int(r["id"]),))
+                                    c.commit()
+                                st.success("Deleted."); st.rerun()
+        st.download_button("Download First-Piece CSV",
+                           df_fp.to_csv(index=False).encode("utf-8"),
+                           "firstpiece_export.csv", "text/csv", use_container_width=True)
 
-    # ----- Render NC cards -----
+    # ---------- NC cards
     if df_nc is not None:
         st.markdown(f"#### Non-Conformity results ({len(df_nc)})")
         if df_nc.empty:
@@ -523,182 +408,143 @@ def page_search():
         else:
             for _, r in df_nc.iterrows():
                 with st.container(border=True):
-                    c0,c1 = st.columns([1,4])
-                    p = ROOT/str(r["img"]) if r.get("img") else None
-                    with c0:
-                        if p and p.exists():
-                            st.image(str(p), width=160)
-                        # Add photo (optional)
-                        add = st.file_uploader(f"Add photo (ID {r['id']})", type=["jpg","jpeg","png"], key=f"addimg_{r['id']}")
+                    left, right = st.columns([2,5])
+                    with left:
+                        p = ROOT/str(r.get("img") or "")
+                        if p.is_file():
+                            st.image(str(p), width=340)
+                        add = st.file_uploader(f"Add photo (ID {r['id']})",
+                                               type=["jpg","jpeg","png"], key=f"add_{r['id']}")
                         if add:
-                            newp = save_image(f"nc/{r.get('model_no') or 'misc'}", add)
-                            with conn() as c:
+                            newp = save_img(f"nc/{r.get('model_no') or 'misc'}", add)
+                            with db() as c:
                                 c.execute("UPDATE nc SET img=? WHERE id=?", (newp, int(r["id"])))
                                 c.commit()
                             st.success("Photo added."); st.rerun()
-                    with c1:
+                    with right:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
                             f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
                         )
-                        # show event date (CSV) not import date
-                        evt = nc_event_date_for_row(r)
-                        st.caption(f"🕒 {evt} · 🧑‍💼 {r['reporter']} · 🏷 Category: {r.get('severity') or '-'}")
+                        st.caption(f"🕒 {evt_date_from_row(r)} · 🧑‍💼 {r['reporter']} · 🏷 Category: {r.get('severity') or '-'}")
                         if r.get("description"): st.write(r["description"])
-
-                        # compact extra as chips
+                        # compact JSON to chips
                         try:
                             extra = json.loads(r.get("extra") or "{}")
-                            if extra:
-                                chips = []
-                                for k, v in extra.items():
-                                    v = str(v).strip()
-                                    if v:
-                                        key = k.replace("_", " ")
-                                        chips.append(f"<span class='chip'><b>{key}</b>: {v}</span>")
-                                if chips:
-                                    st.markdown("<div class='card_extra'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                            chips = [f"<span class='chip'><b>{k.replace('_',' ')}</b>: {str(v).strip()}</span>"
+                                     for k,v in extra.items() if str(v).strip()]
+                            if chips: st.markdown("<div class='chips'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
                         except Exception:
                             pass
-
-                        if can_delete_modify():
-                            if st.button("Delete", key=f"d_nc_{r['id']}"):
-                                with conn() as c:
+                        if can_edit_delete():
+                            if st.button("Delete", key=f"del_nc_{r['id']}"):
+                                with db() as c:
                                     c.execute("DELETE FROM nc WHERE id=?", (int(r["id"]),))
                                     c.commit()
                                 st.success("Deleted."); st.rerun()
+        st.download_button("Download NC CSV",
+                           df_nc.to_csv(index=False).encode("utf-8"),
+                           "nc_export.csv", "text/csv", use_container_width=True)
 
-            # export if results
-            st.download_button(
-                "Download NC CSV",
-                df_nc.to_csv(index=False).encode("utf-8"),
-                "nc_export.csv", "text/csv", use_container_width=True
-            )
-
-def read_any_table(file) -> pd.DataFrame:
-    """Read CSV or Excel (xlsx/xls) and normalize to str."""
+def _read_table(file) -> pd.DataFrame:
+    """Read CSV/XLSX with encoding fallbacks and return str df."""
     name = (file.name or "").lower()
     data = file.read()
-    bio = io.BytesIO(data)
+    bio  = io.BytesIO(data)
     if name.endswith((".xlsx",".xls")):
         return pd.read_excel(bio, dtype=str).fillna("")
-    # CSV: try common encodings
     for enc in ("utf-8-sig","utf-8","big5","cp950","cp1252","latin1"):
         try:
             return pd.read_csv(io.BytesIO(data), dtype=str, encoding=enc).fillna("")
         except Exception:
             continue
-    # fallback sniff
     return pd.read_csv(io.BytesIO(data), dtype=str, engine="python", sep=None).fillna("")
 
 def page_import():
-    require_login()
-    brand_banner()
+    require_login(); banner()
     st.subheader("⬆️ Import CSV / Excel")
+    st.info("Browse a CSV/Excel file, click **Preview**, verify, then **Import**. No auto-import.")
 
-    st.info("Browse a CSV or Excel file, **Preview** it, then click **Import**. Nothing is imported automatically.")
     up = st.file_uploader("Choose CSV/Excel", type=["csv","xlsx","xls"])
     if not up: return
 
     if st.button("Preview", type="secondary"):
         try:
-            st.session_state["import_df"] = read_any_table(up)
+            st.session_state["import_df"] = _read_table(up)
             st.success("Preview ready below.")
         except Exception as e:
             st.error(f"Failed to read file: {e}")
 
     df = st.session_state.get("import_df")
-    if df is not None:
-        st.dataframe(df.head(50), use_container_width=True, hide_index=True)
+    if df is None: return
 
-        # mapping from your Excel headers to NC columns
-        MAP = {
-            "Nonconformity": "severity",
-            "Description of Nonconformity": "description",
-            "Date": "created_date",
-            "Customer/Supplier": "customer_supplier",
-            "Model/Part No.": "model_no",
-            "MO/PO": "mo",
-            "Line": "line",
-            "Work Station": "work_station",
-            "Unit Head": "unit_head",
-            "Responsibility": "responsibility",
-            "Root Cause": "root_cause",
-            "Corrective Action": "corrective_action",
-            "Exception reporters": "exception_reporters",
-            "Discovery": "discovery",
-            "Origil Sources": "origin_sources",
-            "Defective Item": "defective_item",
-            "Defective Outflow": "defective_outflow",
-            "Defective Qty": "defective_qty",
-            "Inspection Qty": "inspection_qty",
-            "Lot Qty": "lot_qty",
-        }
-        missing = [src for src in MAP if src not in df.columns]
-        if missing:
-            st.warning("Missing columns in file: " + ", ".join(missing))
+    st.dataframe(df.head(50), use_container_width=True, hide_index=True)
 
-        if st.button(f"Import {len(df)} rows", type="primary"):
-            imported = 0
-            with conn() as c:
-                for _, row in df.iterrows():
-                    try:
-                        model_no = row.get("Model/Part No.","")
-                        model_version = ""  # usually not in sheet
-                        sn = ""             # usually not in sheet
-                        mo = row.get("MO/PO","")
-                        description = row.get("Description of Nonconformity","")
-                        severity = row.get("Nonconformity","")
+    MAP = {  # Excel header -> json/columns
+        "Nonconformity": "severity",
+        "Description of Nonconformity": "description",
+        "Date": "created_date",
+        "Customer/Supplier": "customer_supplier",
+        "Model/Part No.": "model_no",
+        "MO/PO": "mo",
+        "Line": "line",
+        "Work Station": "work_station",
+        "Unit Head": "unit_head",
+        "Responsibility": "responsibility",
+        "Root Cause": "root_cause",
+        "Corrective Action": "corrective_action",
+        "Exception reporters": "exception_reporters",
+        "Discovery": "discovery",
+        "Origil Sources": "origin_sources",
+        "Defective Item": "defective_item",
+        "Defective Outflow": "defective_outflow",
+        "Defective Qty": "defective_qty",
+        "Inspection Qty": "inspection_qty",
+        "Lot Qty": "lot_qty",
+    }
+    missing = [k for k in MAP if k not in df.columns]
+    if missing:
+        st.warning("Missing columns in file: " + ", ".join(missing))
 
-                        # event date from sheet
-                        cd = row.get("Date","")
-                        created_at = datetime.utcnow().isoformat()
-                        if cd:
-                            try:
-                                # keep a normalized string in extra + fallback stored created_at
-                                created_at = pd.to_datetime(cd).to_pydatetime().isoformat()
-                            except Exception:
-                                pass
-
-                        extra = { MAP[k]: row.get(k,"") for k in MAP if MAP[k] not in ("severity","description","created_date") }
-                        extra["created_date"] = row.get("Date","")
-
-                        c.execute("""
-                            INSERT INTO nc(created_at,model_no,model_version,sn,mo,description,severity,reporter,img,extra)
-                            VALUES(?,?,?,?,?,?,?,?,?,?)
-                        """, (
-                            created_at,
-                            str(model_no), str(model_version), str(sn), str(mo),
-                            str(description), str(severity),
-                            current_user()["display_name"],  # importer as reporter
-                            None,
-                            json.dumps(extra, ensure_ascii=False),
-                        ))
-                        imported += 1
-                    except Exception:
-                        pass
-                c.commit()
-            st.success(f"Imported {imported} rows.")
+    if st.button(f"Import {len(df)} rows", type="primary"):
+        count = 0
+        with db() as c:
+            for _, row in df.iterrows():
+                try:
+                    extra = { MAP[k]: row.get(k,"") for k in MAP if MAP[k] not in ("severity","description","created_date") }
+                    extra["created_date"] = row.get("Date","")
+                    c.execute("""INSERT INTO nc(created_at,model_no,model_version,sn,mo,description,severity,
+                                   reporter,img,extra)
+                                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                              (datetime.utcnow().isoformat(),
+                               str(row.get("Model/Part No.","")), "", "", str(row.get("MO/PO","")),
+                               str(row.get("Description of Nonconformity","")),
+                               str(row.get("Nonconformity","")),
+                               me()["display_name"], None,
+                               json.dumps(extra, ensure_ascii=False)))
+                    count += 1
+                except Exception:
+                    pass
+            c.commit()
+        st.success(f"Imported {count} rows.")
 
 def page_profile():
-    require_login()
-    brand_banner()
-    u = current_user()
+    require_login(); banner()
+    u = me()
     st.subheader("👤 Personal")
     st.write(f"**User:** {u['username']}")
     st.write(f"**Display name:** {u['display_name']}")
     st.write(f"**Role:** {u['role']}")
     st.divider()
     st.markdown("#### Change password")
-    with st.form("chg_pwd"):
+    with st.form("chg_pw"):
         p1 = st.text_input("New password", type="password")
         p2 = st.text_input("Confirm", type="password")
-        ok = st.form_submit_button("Change", type="primary")
-        if ok:
+        if st.form_submit_button("Change", type="primary"):
             if not p1 or p1 != p2:
                 st.error("Password mismatch.")
             else:
-                with conn() as c:
+                with db() as c:
                     c.execute("UPDATE users SET pass_hash=? WHERE id=?", (hash_pwd(p1), u["id"]))
                     c.commit()
                 st.success("Password updated. Please re-login.")
@@ -706,87 +552,64 @@ def page_profile():
 
 def page_users():
     require_login()
-    if current_user()["role"] != "Admin":
+    if me()["role"] != "Admin":
         st.error("Admin only."); return
-    brand_banner()
+    banner()
     st.subheader("⚙️ User Setup (Admin)")
-
-    # add user
     with st.form("add_user", clear_on_submit=True):
-        st.markdown("#### Add user")
         c1,c2,c3 = st.columns(3)
         uname = c1.text_input("Username")
         disp  = c2.text_input("Display name")
         role  = c3.selectbox("Role", ["QA","QC","Admin"], index=1)
         pwd   = st.text_input("Temp password", type="password")
-        ok = st.form_submit_button("Create", type="primary")
-        if ok:
+        if st.form_submit_button("Create", type="primary"):
             if not uname or not pwd:
                 st.error("User & password required.")
             else:
                 try:
-                    with conn() as c:
+                    with db() as c:
                         c.execute("INSERT INTO users(username,pass_hash,display_name,role) VALUES(?,?,?,?)",
                                   (uname, hash_pwd(pwd), disp, role))
                         c.commit()
                     st.success("User created.")
                 except sqlite3.IntegrityError:
                     st.error("Username already exists.")
-
     st.divider()
-    st.markdown("#### All users")
-    with conn() as c:
+    with db() as c:
         rows = c.execute("SELECT id,username,display_name,role FROM users ORDER BY username").fetchall()
     for uid,un,disp,role in rows:
         with st.container(border=True):
             c1,c2,c3,c4 = st.columns([2,2,1,2])
             c1.write(f"**{un}**")
-            new_disp = c2.text_input("Display name", value=disp, key=f"disp_{uid}")
-            new_role = c3.selectbox("Role", options=["Admin","QA","QC"], index=["Admin","QA","QC"].index(role), key=f"role_{uid}")
-            ok1 = c4.button("Update", key=f"upd_{uid}")
-            ok2 = c4.button("Reset password to '123456'", key=f"rst_{uid}")
-            if ok1:
-                with conn() as c:
-                    c.execute("UPDATE users SET display_name=?, role=? WHERE id=?", (new_disp,new_role,uid))
-                    c.commit()
+            new_disp = c2.text_input("Display name", value=disp, key=f"ud_{uid}")
+            new_role = c3.selectbox("Role", ["Admin","QA","QC"],
+                                    index=["Admin","QA","QC"].index(role), key=f"ur_{uid}")
+            if c4.button("Update", key=f"u_{uid}"):
+                with db() as c:
+                    c.execute("UPDATE users SET display_name=?, role=? WHERE id=?",
+                              (new_disp, new_role, uid)); c.commit()
                 st.success("Updated.")
-            if ok2:
-                with conn() as c:
-                    c.execute("UPDATE users SET pass_hash=? WHERE id=?", (hash_pwd("123456"), uid))
-                    c.commit()
+            if c4.button("Reset password to '123456'", key=f"rp_{uid}"):
+                with db() as c:
+                    c.execute("UPDATE users SET pass_hash=? WHERE id=?",
+                              (hash_pwd("123456"), uid)); c.commit()
                 st.success("Password reset.")
 
-# --------------------------- Router ---------------------------------------- #
+# --------------------------- Router / Boot -------------------------------- #
 def router():
     page = st.session_state.get("page", "LOGIN")
-
-    if page == "LOGIN":
-        page_login()
-        return
-
-    if page == "HOME":
-        page_home()
-    elif page == "FP":
-        page_fp_create()
-    elif page == "NC":
-        page_nc_create()
-    elif page == "SEARCH":
-        page_search()
-    elif page == "IMPORT":
-        page_import()
-    elif page == "PROFILE":
-        page_profile()
-    elif page == "USERS":
-        page_users()
-    else:
-        st.session_state["page"] = "HOME"; st.rerun()
-
-    # show bottom nav on all non-login pages
+    if page == "LOGIN":   page_login();  return
+    if page == "HOME":    page_home()
+    elif page == "FP":    page_fp_create()
+    elif page == "NC":    page_nc_create()
+    elif page == "SEARCH":page_search()
+    elif page == "IMPORT":page_import()
+    elif page == "PROFILE":page_profile()
+    elif page == "USERS": page_users()
+    else: st.session_state["page"] = "HOME"; st.rerun()
     bottom_nav()
 
-# --------------------------- Boot ------------------------------------------ #
 if __name__ == "__main__":
     init_db()
     if "page" not in st.session_state: st.session_state["page"] = "LOGIN"
     router()
-
