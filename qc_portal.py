@@ -1,550 +1,687 @@
-# QC Portal (folders + models + First Piece + Nonconformities)
-# Streamlit + SQLite, single-file app
-# - Sidebar: Folders -> Models picker
-# - Tabs: First Piece, Nonconformity, History, Admin
-# - Photos saved under data/images/<model_root>/
-# - Optional Teams notify via env TEAMS_WEBHOOK_URL
+# app.py — Quality Portal - Pilot
+# v2: FP has department & customer_supplier, NC thumbnails smaller,
+#     NC create form reordered, Customer/Supplier filter, gated search, DB auto-migrations.
 
-import os, io, uuid, json, sqlite3, textwrap
+import os
+import json
+import sqlite3
 from pathlib import Path
 from datetime import datetime
-import getpass
+from typing import Optional, Tuple, List
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
+import hashlib
 
-try:
-    import requests
-except Exception:
-    requests = None  # optional
+# -----------------------------------------------------------------------------
+# Storage (Cloud-safe)
+# -----------------------------------------------------------------------------
+def pick_data_dir() -> Path:
+    for base in (Path("/mount/data"), Path("/tmp/qc_portal")):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            (base / ".write_test").write_text("ok", encoding="utf-8")
+            return base
+        except Exception:
+            pass
+    raise RuntimeError("No writable directory found")
 
-APP_DIR = Path(__file__).parent.resolve()
-DATA_DIR = APP_DIR / "data"
+DATA_DIR = pick_data_dir()
 IMG_DIR = DATA_DIR / "images"
+FP_IMG_DIR = IMG_DIR / "first_piece"
+NC_IMG_DIR = IMG_DIR / "nonconformity"
 DB_PATH = DATA_DIR / "qc_portal.sqlite3"
-DATA_DIR.mkdir(exist_ok=True)
-IMG_DIR.mkdir(parents=True, exist_ok=True)
+for p in (IMG_DIR, FP_IMG_DIR, NC_IMG_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
-TEAMS_WEBHOOK = os.getenv("TEAMS_WEBHOOK_URL", "").strip()  # optional
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
 
-# ------------------------- DB -------------------------
-SCHEMA = """
-PRAGMA foreign_keys=ON;
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-CREATE TABLE IF NOT EXISTS folders(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT UNIQUE NOT NULL
+def cur_user() -> Tuple[str, str, str]:
+    # returns (username, display_name, role)
+    ss = st.session_state
+    return ss["auth_username"], ss["auth_display_name"], ss["auth_role"]
+
+def save_image_to(folder: Path, uploaded) -> str:
+    folder.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    clean = uploaded.name.replace(" ", "_")
+    out_path = folder / f"{ts}_{clean}"
+    Image.open(uploaded).convert("RGB").save(out_path, format="JPEG", quality=88)
+    return str(out_path.relative_to(DATA_DIR))
+
+# -----------------------------------------------------------------------------
+# DB
+# -----------------------------------------------------------------------------
+SCHEMA_USERS = """
+CREATE TABLE IF NOT EXISTS users(
+  username TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL,
+  display_name TEXT NOT NULL
 );
+"""
 
+SCHEMA_MODELS = """
 CREATE TABLE IF NOT EXISTS models(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  model_version TEXT NOT NULL,   -- full name e.g. 190A56980
-  model_root TEXT NOT NULL,      -- normalized e.g. 190-56980
-  customer_supplier TEXT,
-  folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
-  UNIQUE(model_version)
+  model_no TEXT PRIMARY KEY,
+  name TEXT
 );
+"""
 
+SCHEMA_FIRST_PIECE = """
 CREATE TABLE IF NOT EXISTS first_piece(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT,
-  model_id INTEGER REFERENCES models(id) ON DELETE CASCADE,
-  model_root TEXT,
+  created_at TEXT,                 -- UTC ISO
+  model_no TEXT,
+  model_version TEXT,
   sn TEXT,
   mo TEXT,
-  status TEXT,         -- OK / NG / Pending
-  review_notes TEXT,
+  department TEXT,                 -- NEW
+  customer_supplier TEXT,          -- NEW
   reporter TEXT,
-  top_image TEXT,      -- rel path
-  bottom_image TEXT
+  description TEXT,
+  top_image_path TEXT,
+  bottom_image_path TEXT,
+  extra JSON
 );
+"""
 
-CREATE TABLE IF NOT EXISTS nonconformities(
+SCHEMA_NONCONF = """
+CREATE TABLE IF NOT EXISTS nonconf(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT,
-  model_id INTEGER REFERENCES models(id) ON DELETE CASCADE,
-  model_root TEXT,
-  customer_supplier TEXT,
+  created_at TEXT,                 -- UTC ISO
+  model_no TEXT,
+  model_version TEXT,
+  sn TEXT,
   mo TEXT,
+  reporter TEXT,
+  severity TEXT,
+  nonconformity TEXT,
+  description TEXT,
+  customer_supplier TEXT,
   line TEXT,
   work_station TEXT,
-  department TEXT,
   unit_head TEXT,
   responsibility TEXT,
   root_cause TEXT,
   corrective_action TEXT,
-  discovery_dept TEXT,
-  source TEXT,
-  defective_category TEXT,
+  exception_reporters TEXT,
+  discovery TEXT,
+  origin_sources TEXT,
   defective_item TEXT,
-  defective_outflow TEXT,
-  defective_qty REAL,
-  inspection_qty REAL,
-  lot_qty REAL,
-  severity TEXT,       -- Critical / Major / Minor
-  description TEXT,
-  reporter TEXT,
-  cover_image TEXT     -- first photo rel path
-);
-
-CREATE TABLE IF NOT EXISTS nc_images(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  nc_id INTEGER REFERENCES nonconformities(id) ON DELETE CASCADE,
-  image_path TEXT
+  defective_qty TEXT,
+  inspection_qty TEXT,
+  lot_qty TEXT,
+  image_paths JSON,
+  extra JSON
 );
 """
 
-def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+def get_conn():
+    return sqlite3.connect(DB_PATH)
 
 def init_db():
-    with conn() as c:
-        for ddl in SCHEMA.split(";\n"):
-            d = ddl.strip()
-            if d:
-                c.execute(d)
-        # default folder
-        c.execute("INSERT OR IGNORE INTO folders(id,name) VALUES(1,'Unassigned')")
+    with get_conn() as c:
+        c.execute(SCHEMA_USERS)
+        c.execute(SCHEMA_MODELS)
+        c.execute(SCHEMA_FIRST_PIECE)
+        c.execute(SCHEMA_NONCONF)
+        c.commit()
+    ensure_default_admin()
+    apply_migrations()
+
+def ensure_default_admin():
+    with get_conn() as c:
+        n = c.execute("SELECT COUNT(*) FROM users WHERE username=?", ("Admin",)).fetchone()[0]
+        if n == 0:
+            c.execute(
+                "INSERT INTO users(username, password_hash, role, display_name) VALUES(?,?,?,?)",
+                ("Admin", sha256("admin1234"), "Admin", "Admin"),
+            )
+            c.commit()
+
+def apply_migrations():
+    """Add missing columns safely if DB is from a previous version."""
+    def col_exists(table, col):
+        with get_conn() as c:
+            cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+            return col in cols
+
+    with get_conn() as c:
+        # first_piece new columns
+        if not col_exists("first_piece", "department"):
+            c.execute("ALTER TABLE first_piece ADD COLUMN department TEXT")
+        if not col_exists("first_piece", "customer_supplier"):
+            c.execute("ALTER TABLE first_piece ADD COLUMN customer_supplier TEXT")
+        # nonconf fields should already match; add if missing (future-proof)
+        for addcol in [
+            ("nonconf", "customer_supplier", "TEXT"),
+            ("nonconf", "image_paths", "JSON"),
+        ]:
+            if not col_exists(addcol[0], addcol[1]):
+                c.execute(f"ALTER TABLE {addcol[0]} ADD COLUMN {addcol[1]} {addcol[2]}")
         c.commit()
 
+# Cached reads
+@st.cache_data(show_spinner=False)
+def list_models_df() -> pd.DataFrame:
+    with get_conn() as c:
+        return pd.read_sql_query("SELECT model_no, COALESCE(name,'') AS name FROM models ORDER BY model_no", c)
+
+@st.cache_data(show_spinner=False)
+def list_users_df() -> pd.DataFrame:
+    with get_conn() as c:
+        return pd.read_sql_query("SELECT username, role, display_name FROM users ORDER BY username", c)
+
+@st.cache_data(show_spinner=False)
+def load_fp_df(filters: dict) -> pd.DataFrame:
+    q = "SELECT * FROM first_piece WHERE 1=1"
+    params = []
+    if filters.get("date_from"):
+        q += " AND created_at >= ?"
+        params.append(filters["date_from"])
+    if filters.get("date_to"):
+        q += " AND created_at <= ?"
+        params.append(filters["date_to"])
+    for col in ["model_no", "model_version", "sn", "mo", "customer_supplier", "department"]:
+        v = filters.get(col, "").strip()
+        if v:
+            q += f" AND {col} LIKE ?"
+            params.append(f"%{v}%")
+    with get_conn() as c:
+        return pd.read_sql_query(q + " ORDER BY id DESC LIMIT 500", c, params=params)
+
+@st.cache_data(show_spinner=False)
+def load_nc_df(filters: dict) -> pd.DataFrame:
+    q = "SELECT * FROM nonconf WHERE 1=1"
+    params = []
+    if filters.get("date_from"):
+        q += " AND created_at >= ?"
+        params.append(filters["date_from"])
+    if filters.get("date_to"):
+        q += " AND created_at <= ?"
+        params.append(filters["date_to"])
+    for col in ["model_no","model_version","sn","mo","customer_supplier"]:
+        v = filters.get(col, "").strip()
+        if v:
+            q += f" AND {col} LIKE ?"
+            params.append(f"%{v}%")
+    text = filters.get("text", "").strip()
+    if text:
+        # search in reporter/severity/description/nonconformity
+        q += " AND (reporter LIKE ? OR severity LIKE ? OR description LIKE ? OR nonconformity LIKE ?)"
+        params.extend([f"%{text}%"] * 4)
+    with get_conn() as c:
+        return pd.read_sql_query(q + " ORDER BY id DESC LIMIT 500", c, params=params)
+
+def invalidate_caches():
+    list_models_df.clear()
+    list_users_df.clear()
+    load_fp_df.clear()
+    load_nc_df.clear()
+
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
+def do_login():
+    st.title("Quality Portal - Pilot")
+    st.subheader("Login")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        u = st.text_input("Username", key="login_user")
+    with c2:
+        p = st.text_input("Password", type="password", key="login_pass")
+
+    if st.button("Sign in", use_container_width=True):
+        with get_conn() as c:
+            row = c.execute("SELECT username,password_hash,role,display_name FROM users WHERE username=?", (u,)).fetchone()
+        if row and sha256(p) == row[1]:
+            st.session_state["auth"] = True
+            st.session_state["auth_username"]  = row[0]
+            st.session_state["auth_role"]      = row[2]
+            st.session_state["auth_display_name"] = row[3]
+            st.success("Welcome!")
+            st.experimental_rerun()
+        else:
+            st.error("Invalid credentials")
+
+# -----------------------------------------------------------------------------
+# UI blocks
+# -----------------------------------------------------------------------------
+def sidebar_admin():
+    username, display, role = cur_user()
+    st.caption(f"Signed in as **{display}** (*{role}*)")
+    st.divider()
+    st.subheader("Users (Admin)")
+    df = list_users_df()
+    st.dataframe(df, hide_index=True, use_container_width=True)
+    with st.expander("Add / Update User"):
+        new_u = st.text_input("Username")
+        new_d = st.text_input("Display name")
+        new_p = st.text_input("Password", type="password")
+        new_r = st.selectbox("Role", ["Admin","QA","QC"], index=2)
+        if st.button("Save user"):
+            if not new_u or not new_p or not new_d:
+                st.error("Please complete all fields.")
+            else:
+                with get_conn() as c:
+                    c.execute(
+                        """INSERT INTO users(username,password_hash,role,display_name)
+                           VALUES(?,?,?,?)
+                           ON CONFLICT(username) DO UPDATE SET
+                             password_hash=excluded.password_hash,
+                             role=excluded.role,
+                             display_name=excluded.display_name
+                        """,
+                        (new_u, sha256(new_p), new_r, new_d),
+                    )
+                    c.commit()
+                list_users_df.clear()
+                st.success("User saved.")
+
+def fp_form():
+    st.subheader("First Piece")
+    with st.form("fp_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            fp_model = st.text_input("Model (short, e.g. 190-56980)")
+            fp_version = st.text_input("Model Version (full)")
+        with col2:
+            fp_sn = st.text_input("SN / Barcode")
+            fp_mo = st.text_input("MO / Work Order")
+        with col3:
+            fp_dept = st.text_input("Department")
+            fp_cs = st.text_input("Customer / Supplier")
+
+        fp_desc = st.text_area("Notes / Description (optional)", height=80)
+        tcol, bcol = st.columns(2)
+        with tcol:
+            top_u = st.file_uploader("TOP image", type=["jpg","jpeg","png"], key="fp_top")
+        with bcol:
+            bot_u = st.file_uploader("BOTTOM image", type=["jpg","jpeg","png"], key="fp_bot")
+
+        submitted = st.form_submit_button("Save first piece")
+        if submitted:
+            if not fp_model.strip():
+                st.error("Model is required.")
+                return
+            top_rel = save_image_to(FP_IMG_DIR, top_u) if top_u else None
+            bot_rel = save_image_to(FP_IMG_DIR, bot_u) if bot_u else None
+            _, disp, _role = cur_user()
+            payload = (
+                now_iso(), fp_model.strip(), fp_version.strip(), fp_sn.strip(), fp_mo.strip(),
+                fp_dept.strip(), fp_cs.strip(), disp, fp_desc.strip(),
+                top_rel, bot_rel, json.dumps({})
+            )
+            with get_conn() as c:
+                c.execute(
+                    """INSERT INTO first_piece
+                       (created_at, model_no, model_version, sn, mo, department, customer_supplier,
+                        reporter, description, top_image_path, bottom_image_path, extra)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    payload,
+                )
+                c.commit()
+            load_fp_df.clear()
+            st.success("First piece saved.")
+
+def nc_form():
+    st.subheader("Create Non-Conformity")
+
+    with st.form("nc_form"):
+        # Top basics
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            nc_model = st.text_input("Model (short)")
+        with b2:
+            nc_version = st.text_input("Model Version")
+        with b3:
+            nc_sn = st.text_input("SN / Barcode")
+        with b4:
+            nc_mo = st.text_input("MO / Work Order")
+
+        # Your specified arrangement (upload photo last)
+        # 1) Nonconformity title & Description
+        nc_title = st.text_input("Nonconformity")
+        nc_desc  = st.text_area("Description of Nonconformity", height=80)
+
+        # 2) Customer/Supplier + Line + Work Station + Unit Head
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            nc_cs = st.text_input("Customer/Supplier")
+        with c2:
+            nc_line = st.text_input("Line")
+        with c3:
+            nc_ws = st.text_input("Work Station")
+        with c4:
+            nc_head = st.text_input("Unit Head")
+
+        # 3) Responsibility + Root Cause + Corrective Action
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            nc_resp = st.text_input("Responsibility")
+        with r2:
+            nc_root = st.text_input("Root Cause")
+        with r3:
+            nc_corr = st.text_input("Corrective Action")
+
+        # 4) Exception reporters + Discovery + Origin Sources
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            nc_except = st.text_input("Exception reporters")
+        with e2:
+            nc_disc = st.text_input("Discovery")
+        with e3:
+            nc_origin = st.text_input("Origil Sources")
+
+        # 5) Defective Item + quantities
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            nc_def_item = st.text_input("Defective Item")
+        with q2:
+            nc_def_qty  = st.text_input("Defective Qty")
+        with q3:
+            nc_insp_qty = st.text_input("Inspection Qty")
+        lot_qty = st.text_input("Lot Qty")
+
+        # 6) Severity & Photos (last)
+        s1, s2 = st.columns([1,3])
+        with s1:
+            nc_sev = st.selectbox("Severity", ["Minor","Major","Critical"], index=0)
+        with s2:
+            nc_imgs = st.file_uploader("Upload photo(s)", accept_multiple_files=True,
+                                       type=["jpg","jpeg","png"])
+
+        submitted = st.form_submit_button("Save non-conformity")
+        if submitted:
+            if not nc_title.strip():
+                st.error("Nonconformity title is required.")
+                return
+            _, disp, _ = cur_user()
+            rels: List[str] = []
+            for f in nc_imgs or []:
+                try:
+                    rels.append(save_image_to(NC_IMG_DIR, f))
+                except Exception as e:
+                    st.error(f"Failed saving {f.name}: {e}")
+            with get_conn() as c:
+                c.execute(
+                    """INSERT INTO nonconf
+                       (created_at, model_no, model_version, sn, mo, reporter, severity,
+                        nonconformity, description, customer_supplier, line, work_station,
+                        unit_head, responsibility, root_cause, corrective_action,
+                        exception_reporters, discovery, origin_sources,
+                        defective_item, defective_qty, inspection_qty, lot_qty,
+                        image_paths, extra)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        now_iso(), nc_model.strip(), nc_version.strip(), nc_sn.strip(), nc_mo.strip(),
+                        disp, nc_sev, nc_title.strip(), nc_desc.strip(), nc_cs.strip(), nc_line.strip(),
+                        nc_ws.strip(), nc_head.strip(), nc_resp.strip(), nc_root.strip(), nc_corr.strip(),
+                        nc_except.strip(), nc_disc.strip(), nc_origin.strip(),
+                        nc_def_item.strip(), nc_def_qty.strip(), nc_insp_qty.strip(), lot_qty.strip(),
+                        json.dumps(rels, ensure_ascii=False), json.dumps({})
+                    ),
+                )
+                c.commit()
+            load_nc_df.clear()
+            st.success("Non-conformity saved.")
+
+# -----------------------------------------------------------------------------
+# Search & View
+# -----------------------------------------------------------------------------
+def search_filters() -> dict:
+    st.subheader("Search & View")
+    with st.expander("Filters", expanded=True):
+        d1, d2 = st.columns(2)
+        with d1:
+            df = st.date_input("Date from", value=None)
+        with d2:
+            dt = st.date_input("Date to", value=None)
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            m = st.text_input("Model contains")
+        with r2:
+            v = st.text_input("Version contains")
+        with r3:
+            sn = st.text_input("SN contains")
+        with r4:
+            mo = st.text_input("MO contains")
+
+        r5, r6 = st.columns(2)
+        with r5:
+            cs = st.text_input("Customer/Supplier contains")
+        with r6:
+            dept = st.text_input("Department contains (FP)")
+
+        text = st.text_input("Text in description/reporter/type (NC only)")
+
+        run = st.button("Search", type="primary")
+    return {
+        "run": run,
+        "date_from": df.strftime("%Y-%m-%d") if df else None,
+        "date_to": (datetime.combine(dt, datetime.min.time()).strftime("%Y-%m-%dT23:59:59") if dt else None),
+        "model_no": m, "model_version": v, "sn": sn, "mo": mo,
+        "customer_supplier": cs, "department": dept, "text": text
+    }
+
+def render_first_piece(df: pd.DataFrame):
+    if df.empty:
+        st.info("No First Piece results.")
+        return
+    st.caption(f"{len(df)} record(s)")
+    for _, r in df.iterrows():
+        with st.container(border=True):
+            header = (
+                f"**Model:** {r['model_no'] or '-'} | "
+                f"**Version:** {r['model_version'] or '-'} | "
+                f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
+            )
+            st.markdown(header)
+            sub = (
+                f"🗓 {r['created_at'][:10]}  ·  👤 {r['reporter']}  ·  "
+                f"🏢 **Dept:** {r.get('department') or '-'}  ·  "
+                f"🏷 **Customer/Supplier:** {r.get('customer_supplier') or '-'}"
+            )
+            st.caption(sub)
+
+            c1, c2 = st.columns(2)
+            p_top = (DATA_DIR / str(r.get("top_image_path"))) if r.get("top_image_path") else None
+            p_bot = (DATA_DIR / str(r.get("bottom_image_path"))) if r.get("bottom_image_path") else None
+            with c1:
+                if p_top and p_top.exists():
+                    st.image(str(p_top), caption="TOP", use_container_width=True)
+            with c2:
+                if p_bot and p_bot.exists():
+                    st.image(str(p_bot), caption="BOTTOM", use_container_width=True)
+
+            if r.get("description"):
+                st.write(r["description"])
+
+def render_nonconf(df: pd.DataFrame, role: str):
+    if df.empty:
+        st.info("No Non-Conformity results.")
+        return
+    st.caption(f"{len(df)} record(s)")
+    for _, r in df.iterrows():
+        with st.container(border=True):
+            st.markdown(
+                f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} "
+                f"| **SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
+            )
+            st.caption(
+                f"🗓 {r['created_at'][:10]} · 👤 {r['reporter']} · "
+                f"Severity: **{r['severity'] or '-'}** · "
+                f"Customer/Supplier: **{r.get('customer_supplier') or '-'}**"
+            )
+            if r.get("nonconformity"):
+                st.markdown(f"**{r['nonconformity']}**")
+            if r.get("description"):
+                st.write(r["description"])
+
+            # thumbnails grid (smaller, no huge white)
+            rels = []
+            try:
+                rels = json.loads(r.get("image_paths") or "[]")
+            except Exception:
+                rels = []
+            if rels:
+                # 4 per row max
+                thumbs = [DATA_DIR / rel for rel in rels]
+                row = st.columns(4)
+                i = 0
+                for p in thumbs:
+                    if p and p.exists():
+                        with row[i % 4]:
+                            st.image(str(p), width=220)
+                    i += 1
+
+            # Extra key items (compact)
+            extras = [
+                ("line","Line"), ("work_station","Work Station"), ("unit_head","Unit Head"),
+                ("responsibility","Responsibility"), ("root_cause","Root Cause"),
+                ("corrective_action","Corrective Action"), ("exception_reporters","Exception reporters"),
+                ("discovery","Discovery"), ("origin_sources","Origil Sources"),
+                ("defective_item","Defective Item"), ("defective_qty","Defective Qty"),
+                ("inspection_qty","Inspection Qty"), ("lot_qty","Lot Qty"),
+            ]
+            small = []
+            for key, label in extras:
+                val = r.get(key)
+                if val:
+                    small.append(f"**{label}:** {val}")
+            if small:
+                st.caption(" · ".join(small))
+
+            # deletion allowed to Admin/QA only
+            if role in ("Admin","QA"):
+                if st.button("Delete", key=f"del_nc_{r['id']}"):
+                    with get_conn() as c:
+                        c.execute("DELETE FROM nonconf WHERE id=?", (int(r["id"]),))
+                        c.commit()
+                    load_nc_df.clear()
+                    st.success("Deleted.")
+                    st.experimental_rerun()
+
+# -----------------------------------------------------------------------------
+# Main App
+# -----------------------------------------------------------------------------
 init_db()
 
-# --------------------- Helpers ------------------------
+st.set_page_config(page_title="Quality Portal - Pilot", layout="wide")
 
-def compute_model_root(model_version: str) -> str:
-    """Take something like 190A56980 -> 190-56980."""
-    v = "".join([ch for ch in (model_version or "").upper() if ch.isalnum()])
-    digits = "".join([d for d in v if d.isdigit()])
-    if len(digits) >= 4:
-        return f"{digits[:3]}-{digits[3:]}"
-    return digits or (model_version or "").strip()
+if "auth" not in st.session_state:
+    st.session_state["auth"] = False
 
-def username():
-    # fallback if you don’t have auth
-    return os.getenv("QC_USER") or getpass.getuser() or "User"
+if not st.session_state["auth"]:
+    do_login()
+    st.stop()
 
-def save_image(model_root: str, file) -> str:
-    folder = IMG_DIR / model_root
-    folder.mkdir(parents=True, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    name = f"{ts}_{uuid.uuid4().hex[:8]}.jpg"
-    out = folder / name
-    img = Image.open(file).convert("RGB")
-    img.save(out, "JPEG", quality=90)
-    return str(out.relative_to(DATA_DIR))
+# Header bar
+title_left, title_right = st.columns([4,1])
+with title_left:
+    st.markdown("## **Quality Portal - Pilot**")
+with title_right:
+    if st.button("Sign out"):
+        for k in list(st.session_state.keys()):
+            if k.startswith("auth"):
+                del st.session_state[k]
+        st.session_state["auth"] = False
+        st.experimental_rerun()
 
-def post_teams_card(title: str, body_lines: list[str]):
-    if not TEAMS_WEBHOOK or not requests:
-        return
-    text = "**" + title + "**\n" + "\n".join(body_lines)
-    try:
-        requests.post(
-            TEAMS_WEBHOOK,
-            headers={"Content-Type": "application/json"},
-            data=json.dumps({"text": text}),
-            timeout=5,
-        )
-    except Exception:
-        pass
-
-# --------------------- Cached Reads -------------------
-@st.cache_data(show_spinner=False)
-def list_folders_df():
-    with conn() as c:
-        return pd.read_sql_query("SELECT id,name FROM folders ORDER BY name", c)
-
-@st.cache_data(show_spinner=False)
-def list_models_df():
-    with conn() as c:
-        q = """SELECT m.id, m.model_version, m.model_root, m.customer_supplier,
-                      f.name AS folder
-               FROM models m LEFT JOIN folders f ON f.id=m.folder_id
-               ORDER BY COALESCE(f.name,'') , m.model_root, m.model_version"""
-        return pd.read_sql_query(q, c)
-
-@st.cache_data(show_spinner=False)
-def fp_for_model(mid: int):
-    with conn() as c:
-        return pd.read_sql_query(
-            "SELECT * FROM first_piece WHERE model_id=? ORDER BY id DESC", c, params=(mid,)
-        )
-
-@st.cache_data(show_spinner=False)
-def nc_for_model(mid: int):
-    with conn() as c:
-        return pd.read_sql_query(
-            "SELECT * FROM nonconformities WHERE model_id=? ORDER BY "
-            "CASE severity WHEN 'Critical' THEN 1 WHEN 'Major' THEN 2 ELSE 3 END, id DESC",
-            c, params=(mid,)
-        )
-
-def bust():
-    list_folders_df.clear(); list_models_df.clear(); fp_for_model.clear(); nc_for_model.clear()
-
-# ------------------------- UI -------------------------
-
-st.set_page_config(page_title="QC Portal", layout="wide")
-st.title("🔎 QC Portal — Folders • Models • First Piece • Nonconformities")
-
-# Sidebar: Folders & Models picker
+# Sidebar
+u_name, disp, role = cur_user()
 with st.sidebar:
-    st.subheader("📁 Folders & Models")
-    folders_df = list_folders_df()
-    models_df = list_models_df()
+    st.markdown(f"**User:** {disp}  \n**Role:** {role}")
+    st.divider()
 
-    folder_names = ["All"] + folders_df["name"].tolist()
-    pick_folder = st.selectbox("Folder", folder_names, key="sb_folder")
+    if role == "Admin":
+        sidebar_admin()
 
-    if pick_folder == "All":
-        sub = models_df
-    else:
-        sub = models_df[models_df["folder"] == pick_folder]
-
-    search = st.text_input("Search (model/version/customer)")
-    if search.strip():
-        s = search.lower().strip()
-        mask = (
-            models_df["model_version"].str.lower().str.contains(s, na=False)
-            | models_df["model_root"].str.lower().str.contains(s, na=False)
-            | models_df["customer_supplier"].fillna("").str.lower().str.contains(s, na=False)
-        )
-        sub = models_df[mask] if pick_folder == "All" else sub[mask]
-
-    if sub.empty:
-        st.info("No models yet.")
-        pick_model_id = None
-    else:
-        labels = [f"{r.model_version}  •  {r.model_root}"
-                  + (f" ({r.customer_supplier})" if r.customer_supplier else "")
-                  for _, r in sub.iterrows()]
-        pick_model_id = st.radio(
-            "Select a model", options=sub["id"].tolist(), format_func=lambda i: labels[sub.index[sub['id']==i][0]],
-            key="sb_model"
-        )
-
-    st.markdown("---")
-    st.caption("Logged in as: **%s**" % username())
-
-# Tabs
-tab_fpa, tab_nc, tab_hist, tab_admin = st.tabs(["First Piece", "Non-conformity", "History", "Admin"])
-
-# --------------------- First Piece Tab ----------------
-with tab_fpa:
-    st.subheader("🧪 First Piece (FPA)")
-    if not pick_model_id:
-        st.info("Pick a model in the left sidebar.")
-    else:
-        row = models_df[models_df["id"] == pick_model_id].iloc[0]
-        col1, col2 = st.columns([2, 1])
-
-        with col1:
-            st.markdown(f"**Model version:** {row.model_version}  •  **Root:** `{row.model_root}`")
-            mo = st.text_input("MO / Work Order")
-            sn = st.text_input("Serial Number (first piece)")
-            status = st.selectbox("Status", ["OK", "NG", "Pending"])
-            review = st.text_area("Review notes (optional)", height=80)
-
-        with col2:
-            up_top = st.file_uploader("Top view photo", type=["jpg","jpeg","png"])
-            up_bot = st.file_uploader("Bottom view photo", type=["jpg","jpeg","png"])
-
-        if st.button("Save First Piece"):
-            top_rel = save_image(row.model_root, up_top) if up_top else None
-            bot_rel = save_image(row.model_root, up_bot) if up_bot else None
-            with conn() as c:
-                c.execute(
-                    "INSERT INTO first_piece(created_at, model_id, model_root, sn, mo, status, review_notes, reporter, top_image, bottom_image) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        datetime.utcnow().isoformat(), int(row.id), row.model_root,
-                        sn.strip(), mo.strip(), status, review.strip(), username(),
-                        top_rel, bot_rel
-                    ),
-                )
-                c.commit()
-            bust()
-            st.success("First Piece saved.")
-            if status == "NG":
-                post_teams_card(
-                    f"FPA NG — {row.model_root} / {row.model_version}",
-                    [
-                        f"MO: {mo}",
-                        f"SN: {sn}",
-                        f"Reporter: {username()}",
-                        f"Notes: {review or '-'}",
-                    ],
-                )
-
-# ------------------ Nonconformity Tab ----------------
-with tab_nc:
-    st.subheader("🚨 Non-conformity")
-    if not pick_model_id:
-        st.info("Pick a model in the left sidebar.")
-    else:
-        row = models_df[models_df["id"] == pick_model_id].iloc[0]
-        st.markdown(f"**Model version:** {row.model_version}  •  **Root:** `{row.model_root}`")
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            customer = st.text_input("Customer / Supplier", value=row.customer_supplier or "")
-            mo_nc = st.text_input("MO / Work Order")
-            line = st.text_input("Line")
-            station = st.text_input("Work Station")
-        with c2:
-            dept = st.text_input("Department")
-            unit_head = st.text_input("Unit Head")
-            resp = st.text_input("Responsibility")
-            discovery = st.text_input("Discovery Dept")
-        with c3:
-            source = st.text_input("Origin Source")
-            cat = st.text_input("Defective Category (e.g., Soldering)")
-            item = st.text_input("Defective Item (e.g., Polarity / Short / Open)")
-            outflow = st.selectbox("Defective Outflow", ["None","OQC","Customer"])
-
-        c4,c5,c6 = st.columns(3)
-        with c4:
-            dq = st.number_input("Defective Qty", min_value=0.0, step=1.0)
-        with c5:
-            iq = st.number_input("Inspection Qty", min_value=0.0, step=1.0)
-        with c6:
-            lq = st.number_input("Lot Qty", min_value=0.0, step=1.0)
-
-        severity = st.selectbox("Severity", ["Critical","Major","Minor"])
-        desc = st.text_area("Description of Nonconformity", height=120)
-
-        photos = st.file_uploader("Upload photos (multiple OK)", type=["jpg","jpeg","png"], accept_multiple_files=True)
-
-        if st.button("Submit Non-conformity"):
-            cover = None
-            saved = []
-            for i, f in enumerate(photos or []):
-                rel = save_image(row.model_root, f)
-                saved.append(rel)
-                if i == 0:
-                    cover = rel
-            with conn() as c:
-                c.execute(
-                    """INSERT INTO nonconformities(
-                        created_at, model_id, model_root, customer_supplier, mo, line, work_station, department, unit_head, responsibility,
-                        root_cause, corrective_action, discovery_dept, source, defective_category, defective_item, defective_outflow,
-                        defective_qty, inspection_qty, lot_qty, severity, description, reporter, cover_image
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        datetime.utcnow().isoformat(), int(row.id), row.model_root, customer.strip(), mo_nc.strip(),
-                        line.strip(), station.strip(), dept.strip(), unit_head.strip(), resp.strip(),
-                        "", "", discovery.strip(), source.strip(), cat.strip(), item.strip(), outflow,
-                        float(dq or 0), float(iq or 0), float(lq or 0), severity, desc.strip(), username(), cover
-                    ),
-                )
-                nid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-                for rel in saved[1:] if saved else []:
-                    c.execute("INSERT INTO nc_images(nc_id,image_path) VALUES(?,?)", (nid, rel))
-                c.commit()
-            bust()
-            st.success("Non-conformity recorded.")
-            post_teams_card(
-                f"NC {severity} — {row.model_root} / {row.model_version}",
-                [
-                    f"MO: {mo_nc}",
-                    f"Station: {station} | Line: {line}",
-                    f"Qty: {dq}/{iq} (Lot {lq})",
-                    f"Reporter: {username()}",
-                    f"Desc: {desc[:300] + ('…' if len(desc)>300 else '')}",
-                ],
-            )
-
-# ----------------------- History Tab -----------------
-with tab_hist:
-    st.subheader("📚 History")
-    if not pick_model_id:
-        st.info("Pick a model in the left sidebar.")
-    else:
-        row = models_df[models_df["id"] == pick_model_id].iloc[0]
-        st.markdown(f"### {row.model_version}  •  `{row.model_root}`")
-
-        st.markdown("#### First Piece")
-        fp = fp_for_model(int(row.id))
-        if fp.empty:
-            st.caption("No FPA yet.")
-        else:
-            for _, r in fp.iterrows():
-                with st.container(border=True):
-                    st.caption(f"{r['created_at']} — MO: {r['mo']} — SN: {r['sn']} — {r['status']}")
-                    st.write(r["review_notes"] or "")
-                    cols = st.columns(2)
-                    for i, key in enumerate(["top_image","bottom_image"]):
-                        path = r[key]
-                        if path:
-                            p = DATA_DIR / path
-                            if p.exists():
-                                cols[i].image(str(p), use_container_width=True)
-
-        st.markdown("#### Non-conformities (Critical → Major → Minor)")
-        nc = nc_for_model(int(row.id))
-        if nc.empty:
-            st.caption("No NC yet.")
-        else:
-            for _, r in nc.iterrows():
-                with st.container(border=True):
-                    st.caption(
-                        f"{r['created_at']} — Severity: {r['severity']} — MO: {r['mo']} "
-                        f"— Station: {r['work_station']} — Qty: {r['defective_qty']}/{r['inspection_qty']}"
-                    )
-                    st.write(r["description"] or "")
-                    if r["cover_image"]:
-                        p = DATA_DIR / r["cover_image"]
-                        if p.exists():
-                            st.image(str(p), use_container_width=True)
-                    # edit / delete (admins)
-                    colA, colB = st.columns(2)
-                    if colA.button("✏️ Edit", key=f"e{r['id']}"):
-                        st.session_state["edit_nc"] = int(r["id"])
-                    if colB.button("🗑️ Delete", key=f"d{r['id']}"):
-                        with conn() as c:
-                            c.execute("DELETE FROM nonconformities WHERE id=?", (int(r["id"]),))
-                            c.commit()
-                        bust()
-                        st.experimental_rerun()
-
-                    # simple inline edit for severity/description
-                    if st.session_state.get("edit_nc") == int(r["id"]):
-                        new_sev = st.selectbox("Severity", ["Critical","Major","Minor"],
-                                               index=["Critical","Major","Minor"].index(r["severity"]),
-                                               key=f"sev_{r['id']}")
-                        new_desc = st.text_area("Description", value=r["description"] or "", key=f"desc_{r['id']}")
-                        if st.button("Save changes", key=f"s{r['id']}"):
-                            with conn() as c:
-                                c.execute("UPDATE nonconformities SET severity=?, description=? WHERE id=?",
-                                          (new_sev, new_desc.strip(), int(r["id"])))
-                                c.commit()
-                            st.session_state.pop("edit_nc", None)
-                            bust()
-                            st.success("Updated.")
-
-# ------------------------ Admin Tab ------------------
-with tab_admin:
-    st.subheader("🛠️ Admin (folders • models • import)")
-    st.caption("Lightweight management. No auth here; control access by who can run the app.")
-
-    st.markdown("### Folders")
-    cA, cB, cC = st.columns([2,2,1])
-    with cA:
-        newf = st.text_input("New folder name")
-        if st.button("Create folder"):
-            if newf.strip():
-                with conn() as c:
-                    c.execute("INSERT OR IGNORE INTO folders(name) VALUES(?)", (newf.strip(),))
-                    c.commit()
-                bust()
-                st.success("Folder created.")
-    with cB:
-        if not folders_df.empty:
-            oldf = st.selectbox("Rename which", options=folders_df["name"].tolist())
-            newname = st.text_input("→ New name")
-            if st.button("Rename folder"):
-                with conn() as c:
-                    c.execute("UPDATE folders SET name=? WHERE name=?", (newname.strip(), oldf))
-                    c.commit()
-                bust(); st.success("Renamed.")
-    with cC:
-        if not folders_df.empty:
-            delf = st.selectbox("Delete", options=folders_df["name"].tolist(), key="del_folder")
-            if st.button("Delete folder"):
-                with conn() as c:
-                    c.execute("DELETE FROM folders WHERE name=?", (delf,))
-                    c.commit()
-                bust(); st.success("Deleted.")
-
-    st.markdown("### Models")
-    m1,m2,m3 = st.columns([2,2,2])
-    with m1:
-        mv = st.text_input("Model version (full) e.g. 190A56980")
-        mr = st.text_input("Model root (auto)", value=compute_model_root(mv), disabled=True)
-        cust = st.text_input("Customer/Supplier")
-        folder_for_new = st.selectbox("Folder", options=folders_df["name"].tolist(), index=0)
-        if st.button("Add / Update model"):
-            with conn() as c:
-                folder_id = int(folders_df[folders_df["name"]==folder_for_new]["id"].iloc[0])
-                c.execute(
-                    "INSERT INTO models(model_version, model_root, customer_supplier, folder_id) VALUES(?,?,?,?) "
-                    "ON CONFLICT(model_version) DO UPDATE SET model_root=excluded.model_root, "
-                    "customer_supplier=excluded.customer_supplier, folder_id=excluded.folder_id",
-                    (mv.strip(), compute_model_root(mv), cust.strip(), folder_id),
-                )
-                c.commit()
-            bust(); st.success("Model saved/updated.")
-    with m2:
-        if not models_df.empty:
-            move_model = st.selectbox("Move / rename model", options=models_df["model_version"].tolist())
-            mv_new = st.text_input("→ New model version (optional)")
-            move_to = st.selectbox("→ Move to folder", options=folders_df["name"].tolist(), key="moveto")
-            if st.button("Apply move/rename"):
-                with conn() as c:
-                    md = models_df[models_df["model_version"]==move_model].iloc[0]
-                    folder_id = int(folders_df[folders_df["name"]==move_to]["id"].iloc[0])
-                    new_ver = (mv_new.strip() or md.model_version)
+    st.subheader("Add / Update Model")
+    m_no = st.text_input("Model number")
+    m_nm = st.text_input("Name / Customer (optional)")
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Save model"):
+            if not m_no.strip():
+                st.error("Model cannot be empty.")
+            else:
+                with get_conn() as c:
                     c.execute(
-                        "UPDATE models SET model_version=?, model_root=?, folder_id=? WHERE id=?",
-                        (new_ver, compute_model_root(new_ver), folder_id, int(md.id))
+                        """INSERT INTO models(model_no,name) VALUES(?,?)
+                           ON CONFLICT(model_no) DO UPDATE SET name=excluded.name""",
+                        (m_no.strip(), m_nm.strip()),
                     )
                     c.commit()
-                bust(); st.success("Applied.")
-    with m3:
-        if not models_df.empty:
-            del_model = st.selectbox("Delete model", options=models_df["model_version"].tolist(), key="delmodel")
-            if st.button("Delete model (and its data)"):
-                with conn() as c:
-                    mid = int(models_df[models_df["model_version"]==del_model]["id"].iloc[0])
-                    c.execute("DELETE FROM models WHERE id=?", (mid,))
+                list_models_df.clear()
+                st.success("Saved.")
+    with colB:
+        if st.button("Delete model", type="secondary"):
+            if not m_no.strip():
+                st.error("Enter model number to delete.")
+            else:
+                with get_conn() as c:
+                    c.execute("DELETE FROM models WHERE model_no=?", (m_no.strip(),))
                     c.commit()
-                bust(); st.success("Model deleted.")
+                list_models_df.clear()
+                st.warning("Deleted.")
 
-    st.markdown("### Import Non-conformities from Excel/CSV")
-    st.caption("Header names auto-mapped if they contain these words: model, version, root, mo, line, station, dept, severity, desc, qty, etc.")
-    up = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"])
-    if up is not None:
-        if up.name.lower().endswith(".csv"):
-            df = pd.read_csv(up)
-        else:
-            df = pd.read_excel(up)
-        st.dataframe(df.head(20), use_container_width=True)
+st.markdown("---")
 
-        if st.button("Import rows"):
-            imported = 0
-            with conn() as c:
-                for _, r in df.iterrows():
-                    mv = str(r.get("ModelVersion") or r.get("model") or r.get("version") or "").strip()
-                    mr = str(r.get("ModelRoot") or r.get("root") or compute_model_root(mv)).strip()
-                    cust = str(r.get("CustomerSupplier") or r.get("customer") or "").strip()
-                    if not (mv or mr):
-                        continue
-                    # upsert model into Unassigned
-                    folder_id = 1
-                    c.execute(
-                        "INSERT INTO models(model_version, model_root, customer_supplier, folder_id) VALUES(?,?,?,?) "
-                        "ON CONFLICT(model_version) DO UPDATE SET model_root=excluded.model_root, customer_supplier=excluded.customer_supplier",
-                        (mv or mr, mr, cust, folder_id)
-                    )
-                    mid = c.execute("SELECT id FROM models WHERE model_version=?", (mv or mr,)).fetchone()[0]
-                    # insert NC
-                    c.execute(
-                        "INSERT INTO nonconformities(created_at, model_id, model_root, customer_supplier, mo, line, work_station, department, "
-                        "severity, description, reporter, defective_qty, inspection_qty, lot_qty) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            datetime.utcnow().isoformat(), mid, mr, cust,
-                            str(r.get("MO") or r.get("mo") or ""), str(r.get("Line") or r.get("line") or ""),
-                            str(r.get("WorkStation") or r.get("station") or ""), str(r.get("Department") or r.get("dept") or ""),
-                            str(r.get("Severity") or r.get("severity") or "Major"),
-                            str(r.get("Description") or r.get("desc") or ""),
-                            username(),
-                            float(r.get("DefectiveQty") or r.get("dq") or 0),
-                            float(r.get("InspectionQty") or r.get("iq") or 0),
-                            float(r.get("LotQty") or r.get("lq") or 0),
-                        )
-                    )
-                    imported += 1
-                c.commit()
-            bust()
-            st.success(f"Imported {imported} rows.")
+# Create blocks (role permissions)
+c1, c2 = st.columns(2)
+with c1:
+    fp_form()
+with c2:
+    nc_form()
+
+st.markdown("---")
+
+# Search & View
+f = search_filters()
+if f["run"]:
+    # First Piece
+    st.markdown("### First Piece (results)")
+    fp_df = load_fp_df(f)
+    render_first_piece(fp_df)
+
+    # Non-Conformities
+    st.markdown("### Non-Conformities (results)")
+    nc_df = load_nc_df(f)
+    render_nonconf(nc_df, role)
+
+    # Export (both tabs)
+    with st.expander("Table view & export"):
+        tab1, tab2 = st.tabs(["First Piece", "Non-Conformities"])
+        with tab1:
+            if not fp_df.empty:
+                st.dataframe(fp_df, use_container_width=True, hide_index=True)
+                st.download_button("Export First Piece (CSV)",
+                                   data=fp_df.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"first_piece_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.csv",
+                                   mime="text/csv")
+            else:
+                st.info("No First Piece rows to export.")
+        with tab2:
+            if not nc_df.empty:
+                st.dataframe(nc_df, use_container_width=True, hide_index=True)
+                st.download_button("Export Non-Conformities (CSV)",
+                                   data=nc_df.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"nonconf_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.csv",
+                                   mime="text/csv")
+            else:
+                st.info("No Non-Conformity rows to export.")
+
+else:
+    st.info("Use **Filters → Search** to load results. Nothing is loaded by default to keep the app fast.")
