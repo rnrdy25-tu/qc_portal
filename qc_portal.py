@@ -211,15 +211,21 @@ def save_image(rel_subdir: str, uploaded_file) -> str:
 def bottom_nav():
     st.divider()
     c1, c2, c3 = st.columns(3)
+
     with c1:
-        if st.button("🏠 Home", use_container_width=True):
-            st.session_state["page"] = "HOME"; st.rerun()
+        if st.button("🏠 Home", key="nav_home", use_container_width=True):
+            st.session_state["page"] = "HOME"
+            st.rerun()
+
     with c2:
-        if st.button("👤 Personal", use_container_width=True):
-            st.session_state["page"] = "PROFILE"; st.rerun()
+        if st.button("👤 Personal", key="nav_personal", use_container_width=True):
+            st.session_state["page"] = "PROFILE"
+            st.rerun()
+
     with c3:
-        if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.clear(); st.rerun()
+        if st.button("🚪 Logout", key="nav_logout", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
 
 # --------------------------- Pages ----------------------------------------- #
 def page_login():
@@ -783,3 +789,4 @@ if __name__ == "__main__":
     init_db()
     if "page" not in st.session_state: st.session_state["page"] = "LOGIN"
     router()
+
