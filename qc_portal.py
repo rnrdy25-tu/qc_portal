@@ -1,641 +1,612 @@
-# app.py — Quality Portal - Pilot (Sidebar Navigation)
-# - Login & roles (Admin/QA/QC)
-# - Sidebar nav shows only one section at a time
-# - First Piece: department & customer_supplier
-# - NC: compact thumbnails; re-ordered fields
-# - Import CSV: Browse -> Load -> Map -> Import (no auto-run)
-# - Search & View: gated (only loads after Search)
-# - Admin pages: Users / Models
+# Quality Management Portal — mobile-first hub
+# Pages: Login → Home tiles → First Piece / Non-Conformity / Search / Import / User Setup / Personal
+# Roles: Admin (all + user setup) / QA (can delete & modify) / QC (cannot delete/modify)
+# Data lives under /mount/data if available, else /tmp/qmp
 
-import os
-import json
-import sqlite3
-import hashlib
-from pathlib import Path
+import os, io, json, sqlite3, hashlib, textwrap, csv
 from datetime import datetime
-from typing import Dict, Optional, List
+from pathlib import Path
+from typing import Optional, Dict, Any
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from PIL import Image
 
-# ─────────────────────────────────────────────
-# App Style
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="Quality Portal - Pilot", layout="wide")
+# --------------------------------------------------------------------------------------
+# Storage (cloud-safe)
+# --------------------------------------------------------------------------------------
+def data_root() -> Path:
+    for p in (Path("/mount/data/qmp"), Path("/tmp/qmp")):
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            (p / ".w").write_text("ok", encoding="utf-8")
+            return p
+        except Exception:
+            continue
+    raise RuntimeError("No writable storage found")
+
+ROOT   = data_root()
+DB     = ROOT / "qmp.sqlite3"
+IMGDIR = ROOT / "images"
+FPDIR  = IMGDIR / "first_piece"
+NCDIR  = IMGDIR / "nonconform"
+for d in (IMGDIR, FPDIR, NCDIR): d.mkdir(parents=True, exist_ok=True)
+
+# --------------------------------------------------------------------------------------
+# Styling (mobile-ish) + page config
+# --------------------------------------------------------------------------------------
+st.set_page_config(page_title="Quality Management Portal", page_icon="🔎", layout="wide")
+
 st.markdown("""
 <style>
-.block-container{padding-top:1rem;padding-bottom:2rem;}
-h1,h2,h3{font-weight:700}
-.smallcap{font-size:0.9rem;color:#6b7280}
-.kbd{padding:.05rem .35rem;border:1px solid #ddd;border-bottom-width:2px;border-radius:4px;background:#f8f9fa;}
+/* Remove the default wide paddings for more app-like feel */
+.block-container{padding-top:0.8rem;padding-bottom:0.5rem;max-width:1200px;}
+/* Tile buttons */
+.qmp-card button{height:120px;width:100%;border-radius:18px;border:0;
+background:linear-gradient(180deg,#fff,#f6f7fb);box-shadow:0 8px 20px rgba(0,0,0,0.06);}
+.qmp-card .st-emotion-cache-1xarl3l{display:none;} /* hide help tooltip container */
+.qmp-banner{
+  background: linear-gradient(135deg,#f2f6ff,#e2f0ff 50%,#eafcf2);
+  border-radius: 18px;
+  padding: 14px 16px 18px 16px;
+  margin: 12px 0 8px 0;
+}
+.qmp-title{font-size:1.25rem;margin:0;color:#083a63;font-weight:700;}
+.qmp-sub{opacity:.85;margin-top:4px}
+.qmp-brand{font-weight:800;letter-spacing:.3px}
+.qmp-foot{
+  position:sticky;bottom:0;left:0;right:0;background:#fff;border-top:1px solid #eee;
+  padding:.35rem .6rem;z-index:99;
+}
+.qmp-chip{display:inline-block;padding:.12rem .5rem;border-radius:999px;background:#eef2ff;border:1px solid #dce3ff}
+.qmp-cap{font-size:.87rem;opacity:.9}
+.qmp-note{font-size:.92rem;opacity:.9}
+.qmp-badge{padding:.25rem .6rem;border-radius:10px;background:#f2f6ff;border:1px solid #dee6ff;margin-left:.35rem}
+.qmp-pic{border-radius:8px;border:1px solid #eef0f5}
+.smalltxt input, .smalltxt textarea, .smalltxt select{font-size:.92rem}
+.card-out{border:1px solid #eef0f5;border-radius:14px;padding:.65rem .8rem;margin:.35rem 0}
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Paths & helpers
-# ─────────────────────────────────────────────
-def pick_data_dir() -> Path:
-    for base in (Path("/mount/data"), Path("/tmp/qc_portal")):
-        try:
-            base.mkdir(parents=True, exist_ok=True)
-            (base/".write_test").write_text("ok", encoding="utf-8")
-            return base
-        except Exception:
-            pass
-    raise RuntimeError("No writable dir")
+# --------------------------------------------------------------------------------------
+# DB schema
+# --------------------------------------------------------------------------------------
+SCHEMA = [
+    # Users
+    """
+    CREATE TABLE IF NOT EXISTS users(
+      username TEXT PRIMARY KEY,
+      pw_hash  TEXT NOT NULL,
+      display  TEXT NOT NULL,
+      role     TEXT NOT NULL CHECK(role in ('Admin','QA','QC'))
+    );""",
+    # First piece
+    """
+    CREATE TABLE IF NOT EXISTS first_piece(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT,
+      model_no TEXT,
+      model_version TEXT,
+      sn TEXT,
+      mo TEXT,
+      department TEXT,
+      customer_supplier TEXT,
+      img_top TEXT,
+      img_bottom TEXT,
+      reporter TEXT
+    );""",
+    # Non-conformities
+    """
+    CREATE TABLE IF NOT EXISTS nc(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT,
+      model_no TEXT,
+      model_version TEXT,
+      sn TEXT,
+      mo TEXT,
+      reporter TEXT,
+      severity TEXT,
+      description TEXT,
+      img TEXT,
+      extra JSON
+    );""",
+]
 
-DATA_DIR = pick_data_dir()
-IMG_DIR = DATA_DIR / "images"
-FP_IMG_DIR = IMG_DIR / "first_piece"
-NC_IMG_DIR = IMG_DIR / "nonconformity"
-for p in (IMG_DIR, FP_IMG_DIR, NC_IMG_DIR): p.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "qc_portal.sqlite3"
+SALT = "qmp_salt_v1"  # for hashing
 
-def now_iso() -> str: return datetime.utcnow().isoformat()
-def sha256(s: str) -> str: return hashlib.sha256(s.encode("utf-8")).hexdigest()
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256((SALT + pw).encode("utf-8")).hexdigest()
 
-def save_image(dest: Path, uploaded) -> Optional[str]:
-    if not uploaded: return None
-    try:
-        dest.mkdir(parents=True, exist_ok=True)
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-        clean = uploaded.name.replace(" ","_")
-        outp = dest / f"{ts}_{clean}"
-        Image.open(uploaded).convert("RGB").save(outp, format="JPEG", quality=88)
-        return str(outp.relative_to(DATA_DIR))
-    except Exception:
-        return None
-
-# ─────────────────────────────────────────────
-# DB schema / init / migrations
-# ─────────────────────────────────────────────
-SCHEMA_USERS = """
-CREATE TABLE IF NOT EXISTS users(
-  username TEXT PRIMARY KEY,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL,
-  display_name TEXT NOT NULL
-);"""
-SCHEMA_MODELS = """
-CREATE TABLE IF NOT EXISTS models(
-  model_no TEXT PRIMARY KEY,
-  name TEXT
-);"""
-SCHEMA_FP = """
-CREATE TABLE IF NOT EXISTS first_piece(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT,
-  model_no TEXT,
-  model_version TEXT,
-  sn TEXT,
-  mo TEXT,
-  department TEXT,
-  customer_supplier TEXT,
-  reporter TEXT,
-  description TEXT,
-  top_image_path TEXT,
-  bottom_image_path TEXT,
-  extra JSON
-);"""
-SCHEMA_NC = """
-CREATE TABLE IF NOT EXISTS nonconf(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT,
-  model_no TEXT,
-  model_version TEXT,
-  sn TEXT,
-  mo TEXT,
-  reporter TEXT,
-  severity TEXT,
-  nonconformity TEXT,
-  description TEXT,
-  customer_supplier TEXT,
-  line TEXT,
-  work_station TEXT,
-  unit_head TEXT,
-  responsibility TEXT,
-  root_cause TEXT,
-  corrective_action TEXT,
-  exception_reporters TEXT,
-  discovery TEXT,
-  origin_sources TEXT,
-  defective_item TEXT,
-  defective_qty TEXT,
-  inspection_qty TEXT,
-  lot_qty TEXT,
-  image_paths JSON,
-  extra JSON
-);"""
-
-def get_conn(): return sqlite3.connect(DB_PATH)
+def conn():
+    return sqlite3.connect(DB, detect_types=sqlite3.PARSE_DECLTYPES)
 
 def init_db():
-    with get_conn() as c:
-        c.execute(SCHEMA_USERS)
-        c.execute(SCHEMA_MODELS)
-        c.execute(SCHEMA_FP)
-        c.execute(SCHEMA_NC)
-        c.commit()
-    ensure_default_admin()
-    migrate_columns()
-
-def ensure_default_admin():
-    with get_conn() as c:
-        n = c.execute("SELECT COUNT(*) FROM users WHERE username='Admin'").fetchone()[0]
-        if n == 0:
-            c.execute("INSERT INTO users VALUES(?,?,?,?)",
-                      ("Admin", sha256("admin1234"), "Admin", "Admin"))
-            c.commit()
-
-def has_column(tbl, col) -> bool:
-    with get_conn() as c:
-        cols = [r[1] for r in c.execute(f"PRAGMA table_info({tbl})")]
-    return col in cols
-
-def migrate_columns():
-    with get_conn() as c:
-        if not has_column("first_piece","department"):
-            c.execute("ALTER TABLE first_piece ADD COLUMN department TEXT")
-        if not has_column("first_piece","customer_supplier"):
-            c.execute("ALTER TABLE first_piece ADD COLUMN customer_supplier TEXT")
-        if not has_column("nonconf","customer_supplier"):
-            c.execute("ALTER TABLE nonconf ADD COLUMN customer_supplier TEXT")
-        if not has_column("nonconf","image_paths"):
-            c.execute("ALTER TABLE nonconf ADD COLUMN image_paths JSON")
+    with conn() as c:
+        for s in SCHEMA: c.execute(s)
+        # bootstrap admin if not exists
+        cur = c.execute("SELECT 1 FROM users WHERE username='admin'")
+        if cur.fetchone() is None:
+            c.execute("INSERT INTO users(username,pw_hash,display,role) VALUES(?,?,?,?)",
+                      ("admin", hash_pw("admin1234"), "Admin", "Admin"))
         c.commit()
 
-# ─────────────────────────────────────────────
-# Cached reads
-# ─────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def list_users_df() -> pd.DataFrame:
-    with get_conn() as c:
-        return pd.read_sql("SELECT username, role, display_name FROM users ORDER BY username", c)
+init_db()
 
-@st.cache_data(show_spinner=False)
-def list_models_df() -> pd.DataFrame:
-    with get_conn() as c:
-        return pd.read_sql("SELECT model_no, COALESCE(name,'') AS name FROM models ORDER BY model_no", c)
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
 
-@st.cache_data(show_spinner=False)
-def load_fp_df(f: Dict) -> pd.DataFrame:
-    q = "SELECT * FROM first_piece WHERE 1=1"; params=[]
-    if f.get("date_from"): q += " AND created_at >= ?"; params.append(f["date_from"])
-    if f.get("date_to"):   q += " AND created_at <= ?"; params.append(f["date_to"])
-    for col in ["model_no","model_version","sn","mo","customer_supplier","department"]:
-        v = (f.get(col) or "").strip()
-        if v: q += f" AND " + col + " LIKE ?"; params.append(f"%{v}%")
-    with get_conn() as c:
-        return pd.read_sql(q + " ORDER BY id DESC LIMIT 500", c, params=params)
+def current_user() -> Optional[Dict[str,Any]]:
+    return st.session_state.get("user")
 
-@st.cache_data(show_spinner=False)
-def load_nc_df(f: Dict) -> pd.DataFrame:
-    q = "SELECT * FROM nonconf WHERE 1=1"; params=[]
-    if f.get("date_from"): q += " AND created_at >= ?"; params.append(f["date_from"])
-    if f.get("date_to"):   q += " AND created_at <= ?"; params.append(f["date_to"])
-    for col in ["model_no","model_version","sn","mo","customer_supplier"]:
-        v = (f.get(col) or "").strip()
-        if v: q += f" AND " + col + " LIKE ?"; params.append(f"%{v}%")
-    text = (f.get("text") or "").strip()
-    if text:
-        q += " AND (reporter LIKE ? OR severity LIKE ? OR description LIKE ? OR nonconformity LIKE ?)"
-        params += [f"%{text}%"]*4
-    with get_conn() as c:
-        return pd.read_sql(q + " ORDER BY id DESC LIMIT 500", c, params=params)
+def require_auth() -> bool:
+    return "user" in st.session_state
 
-def invalidate_caches():
-    list_users_df.clear(); list_models_df.clear()
-    load_fp_df.clear(); load_nc_df.clear()
+def save_img_to(subdir: Path, uploaded) -> str:
+    """Return relative path under ROOT"""
+    if not uploaded: return ""
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    safe = uploaded.name.replace(" ", "_")
+    out = subdir / f"{ts}_{safe}"
+    im = Image.open(uploaded).convert("RGB")
+    im.save(out, format="JPEG", quality=90)
+    return str(out.relative_to(ROOT))
 
-# ─────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────
-def do_login():
-    st.markdown("## 🔎 Quality Portal - Pilot")
-    u = st.text_input("User")
-    p = st.text_input("Password", type="password")
-    if st.button("Sign in", use_container_width=True):
-        with get_conn() as c:
-            row = c.execute("SELECT username,password_hash,role,display_name FROM users WHERE username=?", (u,)).fetchone()
-        if row and sha256(p) == row[1]:
-            st.session_state["auth"] = True
-            st.session_state["auth_username"] = row[0]
-            st.session_state["auth_role"] = row[2]
-            st.session_state["auth_display_name"] = row[3]
-            st.success("Welcome"); st.experimental_rerun()
+def can_delete_modify() -> bool:
+    u = current_user()
+    return bool(u and (u["role"] in ("Admin","QA")))
+
+def is_admin() -> bool:
+    u = current_user()
+    return bool(u and u["role"] == "Admin")
+
+def set_page(p: str):
+    st.session_state["page"] = p
+
+def get_page() -> str:
+    return st.session_state.get("page","HOME")
+
+# --------------------------------------------------------------------------------------
+# Auth views
+# --------------------------------------------------------------------------------------
+def view_login():
+    st.markdown(
+        '<div class="qmp-banner">'
+        '<div class="qmp-title qmp-brand">Quality Management Portal</div>'
+        '<div class="qmp-sub">Please sign in to continue</div>'
+        '</div>', unsafe_allow_html=True
+    )
+    with st.form("login", clear_on_submit=False):
+        u = st.text_input("User", placeholder="username")
+        p = st.text_input("Password", type="password", placeholder="••••••••")
+        ok = st.form_submit_button("Sign in", use_container_width=True)
+        if ok:
+            with conn() as c:
+                cur = c.execute("SELECT username,pw_hash,display,role FROM users WHERE username=?", (u,))
+                row = cur.fetchone()
+            if row and hash_pw(p) == row[1]:
+                st.session_state["user"] = {"username": row[0], "display": row[2], "role": row[3]}
+                set_page("HOME")
+                st.rerun()
+            else:
+                st.error("Invalid user or password.")
+
+# --------------------------------------------------------------------------------------
+# Banner + tiles (Home)
+# --------------------------------------------------------------------------------------
+def banner():
+    user = current_user()
+    name = user["display"] if user else ""
+    st.markdown(
+        f"""
+        <div class="qmp-banner">
+          <div style="display:flex;align-items:center;gap:.8rem">
+            <div style="font-size:40px">🔧</div>
+            <div>
+              <div class="qmp-title">Quality Management Portal</div>
+              <div class="qmp-sub">Hi, <b>{name}</b>. Choose a function below.</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def tile(label:str, emoji:str, page:str):
+    st.markdown('<div class="qmp-card">', unsafe_allow_html=True)
+    if st.button(f"{emoji}\n\n{label}", key=f"tile_{page}"):
+        set_page(page); st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def view_home():
+    banner()
+    c1,c2,c3 = st.columns(3)
+    with c1: tile("First Piece", "📸", "FP")
+    with c2: tile("Non-Conformity", "🛑", "NC")
+    with c3: tile("Search & Export", "🔍", "SEARCH")
+    c4,c5,c6 = st.columns(3)
+    with c4: tile("Import CSV", "⬆️", "IMPORT")
+    with c5:
+        if is_admin():
+            tile("User Setup", "👥", "USERS")
         else:
-            st.error("Invalid username or password")
+            st.empty()
+    with c6: tile("Personal", "👤", "PERSONAL")
 
-def cur_user():
-    return (st.session_state["auth_username"],
-            st.session_state["auth_display_name"],
-            st.session_state["auth_role"])
+# --------------------------------------------------------------------------------------
+# First Piece page
+# --------------------------------------------------------------------------------------
+def page_first_piece():
+    banner()
+    st.subheader("First Piece")
+    st.caption("Save TOP & BOTTOM pictures and basic info. Department and Customer/Supplier are searchable.")
 
-# ─────────────────────────────────────────────
-# Sections (render)
-# ─────────────────────────────────────────────
-def section_first_piece():
-    st.markdown("## First Piece")
-    with st.form("fp_form"):
-        a,b,c = st.columns(3)
-        with a:
-            model = st.text_input("Model (short)")
-            version = st.text_input("Model Version")
-        with b:
-            sn = st.text_input("SN / Barcode")
-            mo = st.text_input("MO / Work Order")
-        with c:
-            dept = st.text_input("Department")
-            cs = st.text_input("Customer / Supplier")
-        desc = st.text_area("Notes / Description", height=90)
-        tcol, bcol = st.columns(2)
-        with tcol: top = st.file_uploader("TOP image", type=["jpg","jpeg","png"])
-        with bcol: bot = st.file_uploader("BOTTOM image", type=["jpg","jpeg","png"])
-        if st.form_submit_button("Save first piece", type="primary"):
-            if not model.strip(): st.error("Model required."); return
-            top_rel = save_image(FP_IMG_DIR, top)
-            bot_rel = save_image(FP_IMG_DIR, bot)
-            _, disp, _ = cur_user()
-            with get_conn() as c:
+    with st.form("fp_form", clear_on_submit=True):
+        colA,colB,colC = st.columns(3)
+        with colA:
+            model_no = st.text_input("Model (short)")
+            sn       = st.text_input("SN / Barcode")
+            dept     = st.text_input("Department")
+        with colB:
+            version  = st.text_input("Model Version")
+            mo       = st.text_input("MO / Work Order")
+            cs       = st.text_input("Customer / Supplier")
+        with colC:
+            top_img  = st.file_uploader("TOP image", type=["jpg","jpeg","png"])
+            bot_img  = st.file_uploader("BOTTOM image", type=["jpg","jpeg","png"])
+        submitted = st.form_submit_button("Save first piece", use_container_width=True)
+
+    if submitted:
+        if not model_no:
+            st.warning("Model is required.")
+        else:
+            rel_top = save_img_to(FPDIR, top_img)
+            rel_bot = save_img_to(FPDIR, bot_img)
+            with conn() as c:
                 c.execute("""INSERT INTO first_piece
-                             (created_at,model_no,model_version,sn,mo,department,customer_supplier,
-                              reporter,description,top_image_path,bottom_image_path,extra)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                          (now_iso(), model.strip(), version.strip(), sn.strip(), mo.strip(),
-                           dept.strip(), cs.strip(), disp, desc.strip(), top_rel, bot_rel, json.dumps({})))
+                    (created_at,model_no,model_version,sn,mo,department,customer_supplier,img_top,img_bottom,reporter)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (now_iso(), model_no.strip(), version.strip(), sn.strip(), mo.strip(),
+                     dept.strip(), cs.strip(), rel_top, rel_bot, current_user()["display"]))
                 c.commit()
-            load_fp_df.clear(); st.success("Saved.")
+            st.success("Saved.")
 
-def section_nonconf():
-    st.markdown("## Create Non-Conformity")
-    with st.form("nc_form"):
-        b1,b2,b3,b4 = st.columns(4)
-        with b1: model = st.text_input("Model")
-        with b2: version = st.text_input("Model Version")
-        with b3: sn = st.text_input("SN / Barcode")
-        with b4: mo = st.text_input("MO / Work Order")
-        title = st.text_input("Nonconformity")
-        desc = st.text_area("Description of Nonconformity", height=90)
+# --------------------------------------------------------------------------------------
+# Non-Conformity page
+# --------------------------------------------------------------------------------------
+NC_EXTRA_FIELDS = [
+    "customer_supplier","line","work_station","unit_head","responsibility",
+    "root_cause","corrective_action","exception_reporters","discovery",
+    "origin_sources","defective_item","defective_qty","inspection_qty","lot_qty"
+]
+
+def page_nc():
+    banner()
+    st.subheader("Create Non-Conformity")
+
+    with st.form("nc_form", clear_on_submit=True):
         c1,c2,c3,c4 = st.columns(4)
-        with c1: cs = st.text_input("Customer/Supplier")
-        with c2: line = st.text_input("Line")
-        with c3: ws = st.text_input("Work Station")
-        with c4: head = st.text_input("Unit Head")
-        r1,r2,r3 = st.columns(3)
-        with r1: resp = st.text_input("Responsibility")
-        with r2: root = st.text_input("Root Cause")
-        with r3: corr = st.text_input("Corrective Action")
-        e1,e2,e3 = st.columns(3)
-        with e1: exr = st.text_input("Exception reporters")
-        with e2: disc = st.text_input("Discovery")
-        with e3: org = st.text_input("Origil Sources")
-        q1,q2,q3 = st.columns(3)
-        with q1: d_item = st.text_input("Defective Item")
-        with q2: d_qty = st.text_input("Defective Qty")
-        with q3: i_qty = st.text_input("Inspection Qty")
-        lot = st.text_input("Lot Qty")
-        s1,s2 = st.columns([1,3])
-        with s1: sev = st.selectbox("Severity", ["Minor","Major","Critical"], index=0)
-        with s2: imgs = st.file_uploader("Upload photo(s)", type=["jpg","jpeg","png"], accept_multiple_files=True)
-        if st.form_submit_button("Save non-conformity", type="primary"):
-            if not title.strip(): st.error("Nonconformity required."); return
-            _, disp, _ = cur_user()
-            rels=[]
-            for f in (imgs or []):
-                rel = save_image(NC_IMG_DIR, f)
-                if rel: rels.append(rel)
-            with get_conn() as c:
-                c.execute("""INSERT INTO nonconf
-                             (created_at,model_no,model_version,sn,mo,reporter,severity,nonconformity,description,
-                              customer_supplier,line,work_station,unit_head,responsibility,root_cause,corrective_action,
-                              exception_reporters,discovery,origin_sources,defective_item,defective_qty,inspection_qty,
-                              lot_qty,image_paths,extra)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                          (now_iso(), model.strip(), version.strip(), sn.strip(), mo.strip(), disp, sev, title.strip(),
-                           desc.strip(), cs.strip(), line.strip(), ws.strip(), head.strip(), resp.strip(), root.strip(),
-                           corr.strip(), exr.strip(), disc.strip(), org.strip(), d_item.strip(), d_qty.strip(),
-                           i_qty.strip(), lot.strip(), json.dumps(rels, ensure_ascii=False), json.dumps({})))
-                c.commit()
-            load_nc_df.clear(); st.success("Saved.")
+        with c1:
+            model_no = st.text_input("Model")
+        with c2:
+            version  = st.text_input("Model Version")
+        with c3:
+            sn       = st.text_input("SN / Barcode")
+        with c4:
+            mo       = st.text_input("MO / Work Order")
 
-# CSV field maps for importer
-FP_MAP = [
-    ("created_at","Date (UTC ISO, optional)"),
-    ("model_no","Model/Part No."),
-    ("model_version","Model Version"),
-    ("sn","SN"),
-    ("mo","MO/PO"),
-    ("department","Department"),
-    ("customer_supplier","Customer/Supplier"),
-    ("reporter","Reporter (optional)"),
-    ("description","Description"),
-]
-NC_MAP = [
-    ("created_at","Date (UTC ISO, optional)"),
-    ("model_no","Model/Part No."),
-    ("model_version","Model Version"),
-    ("sn","SN"),
-    ("mo","MO/PO"),
-    ("reporter","Reporter (optional)"),
-    ("severity","Severity (Minor/Major/Critical)"),
-    ("nonconformity","Nonconformity"),
-    ("description","Description of Nonconformity"),
-    ("customer_supplier","Customer/Supplier"),
-    ("line","Line"),
-    ("work_station","Work Station"),
-    ("unit_head","Unit Head"),
-    ("responsibility","Responsibility"),
-    ("root_cause","Root Cause"),
-    ("corrective_action","Corrective Action"),
-    ("exception_reporters","Exception reporters"),
-    ("discovery","Discovery"),
-    ("origin_sources","Origil Sources"),
-    ("defective_item","Defective Item"),
-    ("defective_qty","Defective Qty"),
-    ("inspection_qty","Inspection Qty"),
-    ("lot_qty","Lot Qty"),
-]
+        severity = st.selectbox("Category", ["Minor","Major","Critical"])
+        desc     = st.text_area("Description of Nonconformity", height=120)
+        # granular categories
+        row1 = st.columns(4)
+        row2 = st.columns(4)
+        row3 = st.columns(4)
+        vals = {}
+        vals["customer_supplier"] = row1[0].text_input("Customer/Supplier")
+        vals["line"]              = row1[1].text_input("Line")
+        vals["work_station"]      = row1[2].text_input("Work Station")
+        vals["unit_head"]         = row1[3].text_input("Unit Head")
+        vals["responsibility"]    = row2[0].text_input("Responsibility")
+        vals["root_cause"]        = row2[1].text_input("Root Cause")
+        vals["corrective_action"] = row2[2].text_input("Corrective Action")
+        vals["exception_reporters"]= row2[3].text_input("Exception reporters")
+        vals["discovery"]         = row3[0].text_input("Discovery")
+        vals["origin_sources"]    = row3[1].text_input("Origin Sources")
+        vals["defective_item"]    = row3[2].text_input("Defective Item")
+        qrow = st.columns(3)
+        vals["defective_qty"]     = qrow[0].text_input("Defective Qty")
+        vals["inspection_qty"]    = qrow[1].text_input("Inspection Qty")
+        vals["lot_qty"]           = qrow[2].text_input("Lot Qty")
 
-def try_read_csv(up) -> Optional[pd.DataFrame]:
-    for enc in ["utf-8-sig","utf-8","cp950","big5","cp932","cp936","cp1252"]:
+        img = st.file_uploader("Photo (optional)", type=["jpg","jpeg","png"])
+        ok  = st.form_submit_button("Save non-conformity", use_container_width=True)
+
+    if ok:
+        rel = save_img_to(NCDIR, img) if img else ""
+        with conn() as c:
+            c.execute("""INSERT INTO nc
+                (created_at,model_no,model_version,sn,mo,reporter,severity,description,img,extra)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (now_iso(), model_no.strip(), version.strip(), sn.strip(), mo.strip(),
+                 current_user()["display"], severity, desc.strip(), rel, json.dumps(vals, ensure_ascii=False)))
+            c.commit()
+        st.success("Saved.")
+
+# --------------------------------------------------------------------------------------
+# Search & Export page (does nothing until Search is clicked)
+# --------------------------------------------------------------------------------------
+def page_search():
+    banner()
+    st.subheader("Search & Export")
+
+    st.markdown("##### Filters")
+    f1,f2,f3,f4,f5 = st.columns([1,1,1,1,1.2])
+    model  = f1.text_input("Model contains")
+    vers   = f2.text_input("Version contains")
+    sn     = f3.text_input("SN contains")
+    mo     = f4.text_input("MO contains")
+    textin = f5.text_input("Text in description/reporter/type/extra")
+
+    df1, df2 = None, None
+    if st.button("Search", type="primary"):
+        # First piece
+        q  = "SELECT * FROM first_piece WHERE 1=1"
+        pa = []
+        for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo),
+                        ("customer_supplier", textin)):
+            if val:
+                q += f" AND {col} LIKE ?"; pa.append(f"%{val}%")
+        q += " ORDER BY id DESC LIMIT 100"
+        with conn() as c:
+            df1 = pd.read_sql_query(q, c, params=pa)
+
+        # NC
+        qn, pn = "SELECT * FROM nc WHERE 1=1", []
+        for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
+            if val:
+                qn += f" AND {col} LIKE ?"; pn.append(f"%{val}%")
+        if textin:
+            qn += " AND (description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)"
+            pn += [f"%{textin}%"]*4
+        qn += " ORDER BY id DESC LIMIT 100"
+        with conn() as c:
+            df2 = pd.read_sql_query(qn, c, params=pn)
+
+        st.toast("Loaded results.")
+
+    # results UI
+    if df1 is not None:
+        with st.expander(f"First Piece results ({len(df1)})", expanded=True):
+            for _,r in df1.iterrows():
+                with st.container(border=True):
+                    cols = st.columns([1,1,4])
+                    p_top = ROOT / str(r["img_top"]) if r["img_top"] else None
+                    p_bot = ROOT / str(r["img_bottom"]) if r["img_bottom"] else None
+                    with cols[0]:
+                        if p_top and p_top.exists(): st.image(str(p_top), width=180, caption="TOP", output_format="JPEG")
+                    with cols[1]:
+                        if p_bot and p_bot.exists(): st.image(str(p_bot), width=180, caption="BOTTOM", output_format="JPEG")
+                    with cols[2]:
+                        st.markdown(
+                            f"**Model:** {r['model_no'] or '-'} "
+                            f"&nbsp;|&nbsp; **Version:** {r['model_version'] or '-'} "
+                            f"&nbsp;|&nbsp; **SN:** {r['sn'] or '-'} "
+                            f"&nbsp;|&nbsp; **MO:** {r['mo'] or '-'}")
+                        st.caption(f"🕒 {r['created_at']}  •  🧑‍💼 Reporter: {r['reporter']}  "
+                                   f"•  🏷 Dept: {r['department'] or '-'}  •  👥 Customer/Supplier: {r['customer_supplier'] or '-'}")
+            with st.expander("Table view & export"):
+                st.dataframe(df1, use_container_width=True, hide_index=True)
+                st.download_button("Download First-Piece CSV", df1.to_csv(index=False).encode("utf-8"),
+                                   "firstpiece_export.csv", "text/csv")
+
+    if df2 is not None:
+        with st.expander(f"Non-Conformity results ({len(df2)})", expanded=True):
+            for _,r in df2.iterrows():
+                with st.container(border=True):
+                    c1,c2 = st.columns([1,4])
+                    p = ROOT / str(r["img"]) if r["img"] else None
+                    with c1:
+                        if p and p.exists(): st.image(str(p), width=180, output_format="JPEG", caption="")
+                    with c2:
+                        st.markdown(
+                            f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
+                            f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}")
+                        st.caption(f"🕒 {r['created_at']}  •  🧑‍💼 Reporter: {r['reporter']}  •  🏷 Category: {r['severity']}")
+                        if r["description"]:
+                            st.write(r["description"])
+                        try:
+                            extra = json.loads(r["extra"] or "{}")
+                            if extra:
+                                # show compact chips
+                                line = "  ".join([f"**{k.replace('_',' ')}:** {v}" for k,v in extra.items() if str(v).strip()])
+                                st.markdown(line)
+                        except Exception:
+                            pass
+                        if can_delete_modify():
+                            if st.button("Delete", key=f"del_nc_{r['id']}"):
+                                with conn() as c:
+                                    c.execute("DELETE FROM nc WHERE id=?", (int(r["id"]),))
+                                    c.commit()
+                                st.success("Deleted."); st.rerun()
+            with st.expander("Table view & export"):
+                st.dataframe(df2, use_container_width=True, hide_index=True)
+                st.download_button("Download NC CSV", df2.to_csv(index=False).encode("utf-8"),
+                                   "nc_export.csv", "text/csv")
+
+# --------------------------------------------------------------------------------------
+# Import CSV page (safe – requires click)
+# --------------------------------------------------------------------------------------
+NC_IMPORT_MAP = {
+  # CSV/Excel column -> DB field (extra for unmapped is allowed)
+  "Nonconformity": "severity",
+  "Description of Nonconformity": "description",
+  "Date": "created_at",
+  "Customer/Supplier": ("extra","customer_supplier"),
+  "Model/Part No.": "model_no",
+  "MO/PO": "mo",
+  "Line": ("extra","line"),
+  "Work Station": ("extra","work_station"),
+  "Unit Head": ("extra","unit_head"),
+  "Responsibility": ("extra","responsibility"),
+  "Root Cause": ("extra","root_cause"),
+  "Corrective Action": ("extra","corrective_action"),
+  "Exception reporters": ("extra","exception_reporters"),
+  "Discovery": ("extra","discovery"),
+  "Origil Sources": ("extra","origin_sources"),
+  "Defective Item": ("extra","defective_item"),
+  "Defective Outflow": ("extra","defective_outflow"),
+  "Defective Qty": ("extra","defective_qty"),
+  "Inspection Qty": ("extra","inspection_qty"),
+  "Lot Qty": ("extra","lot_qty"),
+}
+
+def best_csv_read(file, encoding: str) -> pd.DataFrame:
+    # try utf-8, big5, cp950 fallback
+    for enc in ([encoding] if encoding else []) + ["utf-8", "utf-8-sig", "big5", "cp950", "latin1"]:
         try:
-            up.seek(0); return pd.read_csv(up, encoding=enc)
-        except Exception: continue
-    return None
+            return pd.read_csv(file, encoding=enc)
+        except Exception:
+            file.seek(0)
+    # last try with excel
+    try:
+        return pd.read_excel(file)
+    except Exception as e:
+        raise e
 
-def section_import():
-    st.markdown("## Import (CSV)")
-    target = st.radio("Import into", ["First Piece","Non-Conformities"], horizontal=True)
-    up = st.file_uploader("Browse CSV", type=["csv"], key="import_csv")
-    if st.button("Load file", type="primary", disabled=(up is None)):
-        st.session_state["import_df"] = try_read_csv(up)
-        if st.session_state["import_df"] is None:
-            st.error("Cannot read file. Try UTF-8/Big5/CP950.")
-        else:
-            st.success("File loaded. Map columns then click Import.")
-    df = st.session_state.get("import_df")
-    if isinstance(df, pd.DataFrame):
-        st.caption(f"Preview: {df.shape[0]} rows × {df.shape[1]} cols")
-        st.dataframe(df.head(20), use_container_width=True, hide_index=True)
-        st.markdown("**Map columns**")
-        wanted = FP_MAP if target=="First Piece" else NC_MAP
-        sel={}
-        for k,lbl in wanted:
-            default = k if k in df.columns else None
-            idx = 1+list(df.columns).index(default) if default else 0
-            sel[k]=st.selectbox(lbl, ["(none)"]+list(df.columns), index=idx, key=f"map_{target}_{k}")
-        if st.button(f"Import {target}", type="primary"):
-            rows=0
-            _, disp, _ = cur_user()
-            with get_conn() as c:
-                for _, r in df.iterrows():
-                    def get(colkey):
-                        col = sel[colkey]
-                        if not col or col=="(none)": return ""
-                        v = r[col]
-                        return "" if pd.isna(v) else str(v)
-                    created = get("created_at") or now_iso()
-                    if target=="First Piece":
-                        payload=(created,get("model_no"),get("model_version"),get("sn"),get("mo"),
-                                 get("department"),get("customer_supplier"),
-                                 get("reporter") or disp, get("description"), None, None, json.dumps({}))
-                        c.execute("""INSERT INTO first_piece
-                                     (created_at,model_no,model_version,sn,mo,department,customer_supplier,
-                                      reporter,description,top_image_path,bottom_image_path,extra)
-                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
-                    else:
-                        payload=(created,get("model_no"),get("model_version"),get("sn"),get("mo"),
-                                 get("reporter") or disp, get("severity") or "Minor", get("nonconformity"),
-                                 get("description"), get("customer_supplier"), get("line"), get("work_station"),
-                                 get("unit_head"), get("responsibility"), get("root_cause"), get("corrective_action"),
-                                 get("exception_reporters"), get("discovery"), get("origin_sources"), get("defective_item"),
-                                 get("defective_qty"), get("inspection_qty"), get("lot_qty"), json.dumps([]), json.dumps({}))
-                        c.execute("""INSERT INTO nonconf
-                                     (created_at,model_no,model_version,sn,mo,reporter,severity,nonconformity,description,
-                                      customer_supplier,line,work_station,unit_head,responsibility,root_cause,corrective_action,
-                                      exception_reporters,discovery,origin_sources,defective_item,defective_qty,inspection_qty,
-                                      lot_qty,image_paths,extra)
-                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
-                    rows+=1
+def page_import():
+    banner()
+    st.subheader("Import CSV (Non-Conformities)")
+    up = st.file_uploader("Upload CSV/Excel", type=["csv","xlsx","xls"])
+    enc = st.selectbox("If file has Chinese, try an encoding", ["(auto)","utf-8","utf-8-sig","big5","cp950","latin1"])
+    if up:
+        if st.button("Preview & Import", type="primary"):
+            df = best_csv_read(up, None if enc=="(auto)" else enc)
+            st.write("Preview (first 50 rows)")
+            st.dataframe(df.head(50), use_container_width=True)
+            if st.button("Import now"):
+                n=0
+                with conn() as c:
+                    for _,row in df.iterrows():
+                        model = str(row.get("Model/Part No.", "")).strip()
+                        mo    = str(row.get("MO/PO","")).strip()
+                        created = str(row.get("Date","")).strip() or now_iso()
+                        # map
+                        severity = str(row.get("Nonconformity","")).strip()
+                        desc     = str(row.get("Description of Nonconformity","")).strip()
+                        extra={}
+                        for k, target in NC_IMPORT_MAP.items():
+                            if isinstance(target, tuple):  # extra
+                                _, sub = target
+                                extra[sub] = row.get(k, "")
+                        c.execute("""INSERT INTO nc
+                          (created_at,model_no,model_version,sn,mo,reporter,severity,description,img,extra)
+                          VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                          (created, model, "", "", mo, current_user()["display"], severity, desc, "", json.dumps(extra, ensure_ascii=False)))
+                        n+=1
+                    c.commit()
+                st.success(f"Imported {n} rows.")
+    else:
+        st.info("Choose a CSV/Excel file, then click **Preview & Import**. Nothing is imported until you click the second button.")
+
+# --------------------------------------------------------------------------------------
+# User setup (Admin only)
+# --------------------------------------------------------------------------------------
+def page_users():
+    banner()
+    if not is_admin():
+        st.warning("Admins only.")
+        return
+    st.subheader("User Setup")
+    with st.form("new_user"):
+        u = st.text_input("Username")
+        d = st.text_input("Display name")
+        r = st.selectbox("Role", ["QC","QA","Admin"])
+        p1= st.text_input("Temp password", type="password")
+        ok= st.form_submit_button("Create")
+    if ok:
+        with conn() as c:
+            cur = c.execute("SELECT 1 FROM users WHERE username=?", (u,))
+            if cur.fetchone():
+                st.warning("User already exists.")
+            else:
+                c.execute("INSERT INTO users(username,pw_hash,display,role) VALUES(?,?,?,?)",
+                          (u, hash_pw(p1), d, r))
                 c.commit()
-            load_fp_df.clear(); load_nc_df.clear()
-            st.success(f"Imported {rows} row(s).")
+                st.success("User created.")
+    # list
+    with conn() as c:
+        df = pd.read_sql_query("SELECT username,display,role FROM users ORDER BY username", c)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-def render_fp_cards(df: pd.DataFrame):
-    if df.empty: st.info("No First Piece results."); return
-    st.caption(f"{len(df)} record(s)")
-    for _, r in df.iterrows():
-        with st.container(border=True):
-            st.markdown(
-                f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} "
-                f"| **SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
-            )
-            st.caption(
-                f"🗓 {r['created_at'][:10]} · 👤 {r['reporter']} · "
-                f"🏢 Dept: {r.get('department') or '-'} · "
-                f"🏷 Customer/Supplier: {r.get('customer_supplier') or '-'}"
-            )
-            c1,c2 = st.columns(2)
-            p_top = (DATA_DIR / str(r.get("top_image_path"))) if r.get("top_image_path") else None
-            p_bot = (DATA_DIR / str(r.get("bottom_image_path"))) if r.get("bottom_image_path") else None
-            with c1:
-                if p_top and p_top.exists(): st.image(str(p_top), caption="TOP", use_container_width=True)
-            with c2:
-                if p_bot and p_bot.exists(): st.image(str(p_bot), caption="BOTTOM", use_container_width=True)
-            if r.get("description"): st.write(r["description"])
+# --------------------------------------------------------------------------------------
+# Personal page
+# --------------------------------------------------------------------------------------
+def page_personal():
+    banner()
+    u = current_user()
+    if not u: return
+    st.subheader("Account")
+    st.write(f"**User**: {u['username']} • **Display**: {u['display']} • **Role**: {u['role']}")
+    with st.form("pwchg", clear_on_submit=True):
+        cur = st.text_input("Current password", type="password")
+        new1= st.text_input("New password", type="password")
+        new2= st.text_input("Repeat new password", type="password")
+        save= st.form_submit_button("Change password")
+    if save:
+        with conn() as c:
+            row = c.execute("SELECT pw_hash FROM users WHERE username=?", (u["username"],)).fetchone()
+        if not row or row[0] != hash_pw(cur):
+            st.error("Current password incorrect.")
+        elif len(new1) < 8 or new1 != new2:
+            st.error("New password must match and be ≥ 8 characters.")
+        else:
+            with conn() as c:
+                c.execute("UPDATE users SET pw_hash=? WHERE username=?", (hash_pw(new1), u["username"]))
+                c.commit()
+            st.success("Password changed.")
+    st.divider()
+    if st.button("Log out", type="secondary"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
 
-def render_nc_cards(df: pd.DataFrame, role: str):
-    if df.empty: st.info("No Non-Conformity results."); return
-    st.caption(f"{len(df)} record(s)")
-    for _, r in df.iterrows():
-        with st.container(border=True):
-            st.markdown(
-                f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} "
-                f"| **SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
-            )
-            st.caption(
-                f"🗓 {r['created_at'][:10]} · 👤 {r['reporter']} · "
-                f"Severity: **{r['severity'] or '-'}** · "
-                f"Customer/Supplier: **{r.get('customer_supplier') or '-'}**"
-            )
-            if r.get("nonconformity"): st.markdown(f"**{r['nonconformity']}**")
-            if r.get("description"): st.write(r["description"])
+# --------------------------------------------------------------------------------------
+# Footer nav
+# --------------------------------------------------------------------------------------
+def footer_nav():
+    c1,c2,c3 = st.columns([1,1,1])
+    with c1:
+        if st.button("🏠 Home", use_container_width=True):
+            set_page("HOME"); st.rerun()
+    with c2:
+        if st.button("👤 Personal", use_container_width=True):
+            set_page("PERSONAL"); st.rerun()
+    with c3:
+        if is_admin():
+            st.caption("Admin")
 
-            # thumbnails (compact)
-            rels=[]
-            try: rels = json.loads(r.get("image_paths") or "[]")
-            except Exception: rels=[]
-            if rels:
-                row = st.columns(4); i=0
-                for rel in rels:
-                    p = DATA_DIR / rel
-                    if p.exists():
-                        with row[i%4]: st.image(str(p), width=210)
-                        i+=1
-
-            # brief meta
-            fields = [
-                ("line","Line"),("work_station","Work Station"),("unit_head","Unit Head"),
-                ("responsibility","Responsibility"),("root_cause","Root Cause"),
-                ("corrective_action","Corrective Action"),("exception_reporters","Exception reporters"),
-                ("discovery","Discovery"),("origin_sources","Origil Sources"),
-                ("defective_item","Defective Item"),("defective_qty","Defective Qty"),
-                ("inspection_qty","Inspection Qty"),("lot_qty","Lot Qty"),
-            ]
-            bits=[f"**{lbl}:** {r.get(k)}" for k,lbl in fields if r.get(k)]
-            if bits: st.caption(" · ".join(bits))
-
-            if role in ("Admin","QA"):
-                if st.button("Delete", key=f"del_nc_{r['id']}"):
-                    with get_conn() as c:
-                        c.execute("DELETE FROM nonconf WHERE id=?", (int(r["id"]),)); c.commit()
-                    load_nc_df.clear(); st.success("Deleted."); st.experimental_rerun()
-
-def section_search_view(role: str):
-    st.markdown("## Search & View")
-    with st.expander("Filters", expanded=True):
-        d1,d2 = st.columns(2)
-        with d1: dfrom = st.date_input("Date from", value=None)
-        with d2: dto = st.date_input("Date to", value=None)
-        r1,r2,r3,r4 = st.columns(4)
-        with r1: m = st.text_input("Model")
-        with r2: v = st.text_input("Version")
-        with r3: sn = st.text_input("SN")
-        with r4: mo = st.text_input("MO")
-        r5,r6 = st.columns(2)
-        with r5: cs = st.text_input("Customer/Supplier")
-        with r6: dept = st.text_input("Department (FP)")
-        text = st.text_input("Text (NC only; description/reporter/type)")
-        run = st.button("Search", type="primary")
-
-    f = {
-        "run": run,
-        "date_from": dfrom.strftime("%Y-%m-%d") if dfrom else None,
-        "date_to": (datetime.combine(dto, datetime.min.time()).strftime("%Y-%m-%dT23:59:59") if dto else None),
-        "model_no": m, "model_version": v, "sn": sn, "mo": mo,
-        "customer_supplier": cs, "department": dept, "text": text
-    }
-
-    if not run:
-        st.info("Set filters and click **Search**. Nothing loads by default.")
+# --------------------------------------------------------------------------------------
+# Router
+# --------------------------------------------------------------------------------------
+def router():
+    if not require_auth():
+        view_login()
         return
 
-    st.markdown("### First Piece (results)")
-    fp_df = load_fp_df(f); render_fp_cards(fp_df)
+    page = get_page()
+    if page == "HOME":          view_home()
+    elif page == "FP":          page_first_piece()
+    elif page == "NC":          page_nc()
+    elif page == "SEARCH":      page_search()
+    elif page == "IMPORT":      page_import()
+    elif page == "USERS":       page_users()
+    elif page == "PERSONAL":    page_personal()
+    else:
+        set_page("HOME"); view_home()
 
-    st.markdown("### Non-Conformities (results)")
-    nc_df = load_nc_df(f); render_nc_cards(nc_df, role)
+    st.markdown('<div class="qmp-foot"></div>', unsafe_allow_html=True)
+    footer_nav()
 
-    with st.expander("Table view & export"):
-        t1, t2 = st.tabs(["First Piece","Non-Conformities"])
-        with t1:
-            if not fp_df.empty:
-                st.dataframe(fp_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Export First Piece CSV",
-                    fp_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"first_piece_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-            else: st.info("No rows.")
-        with t2:
-            if not nc_df.empty:
-                st.dataframe(nc_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Export Non-Conformities CSV",
-                    nc_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"nonconf_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-            else: st.info("No rows.")
-
-def section_models():
-    st.markdown("## Models (Admin)")
-    st.dataframe(list_models_df(), hide_index=True, use_container_width=True)
-    with st.expander("Add / Update Model", expanded=True):
-        m = st.text_input("Model")
-        nm = st.text_input("Name / Customer (optional)")
-        c1,c2=st.columns(2)
-        with c1:
-            if st.button("Save model"):
-                if not m.strip(): st.error("Model required.")
-                else:
-                    with get_conn() as c:
-                        c.execute("""INSERT INTO models(model_no,name) VALUES(?,?)
-                                     ON CONFLICT(model_no) DO UPDATE SET name=excluded.name""",
-                                  (m.strip(), nm.strip())); c.commit()
-                    list_models_df.clear(); st.success("Saved.")
-        with c2:
-            if st.button("Delete model", type="secondary"):
-                if not m.strip(): st.error("Enter model")
-                else:
-                    with get_conn() as c:
-                        c.execute("DELETE FROM models WHERE model_no=?", (m.strip(),)); c.commit()
-                    list_models_df.clear(); st.warning("Deleted.")
-
-def section_users():
-    st.markdown("## Users (Admin)")
-    st.dataframe(list_users_df(), hide_index=True, use_container_width=True)
-    with st.expander("Add / Update User", expanded=True):
-        nu = st.text_input("Username")
-        nd = st.text_input("Display name")
-        npw = st.text_input("Password", type="password")
-        nr = st.selectbox("Role", ["Admin","QA","QC"], index=2)
-        if st.button("Save user"):
-            if not nu or not nd or not npw:
-                st.error("Complete all fields.")
-            else:
-                with get_conn() as c:
-                    c.execute("""INSERT INTO users(username,password_hash,role,display_name)
-                                 VALUES(?,?,?,?)
-                                 ON CONFLICT(username) DO UPDATE SET
-                                  password_hash=excluded.password_hash,
-                                  role=excluded.role,
-                                  display_name=excluded.display_name""",
-                              (nu, sha256(npw), nr, nd)); c.commit()
-                list_users_df.clear(); st.success("User saved.")
-
-# ─────────────────────────────────────────────
-# App flow
-# ─────────────────────────────────────────────
-init_db()
-if "auth" not in st.session_state: st.session_state["auth"]=False
-if not st.session_state["auth"]:
-    do_login(); st.stop()
-
-# Top header
-left, right = st.columns([6,1])
-with left: st.markdown("## 🔎 Quality Portal — Models, First Piece, Non-Conformities, Search & Import")
-with right:
-    if st.button("Sign out", use_container_width=True):
-        for k in list(st.session_state.keys()):
-            if k.startswith("auth"): del st.session_state[k]
-        st.session_state["auth"]=False; st.experimental_rerun()
-
-# Sidebar Navigation
-_, disp, role = cur_user()
-with st.sidebar:
-    st.markdown(f"**User:** {disp}  \n**Role:** {role}")
-    st.divider()
-    nav_items = ["Create First Piece","Create Non-Conformity","Import CSV","Search & View"]
-    if role == "Admin":
-        nav_items += ["Models (Admin)","Users (Admin)"]
-    choice = st.radio("Go to", nav_items, index=3)  # default to Search & View
-    st.caption("Use the sidebar to switch sections. The main page shows only the selected section.")
-
-# Show only the selected section
-if choice == "Create First Piece":
-    section_first_piece()
-elif choice == "Create Non-Conformity":
-    section_nonconf()
-elif choice == "Import CSV":
-    section_import()
-elif choice == "Search & View":
-    section_search_view(role)
-elif choice == "Models (Admin)":
-    if role != "Admin": st.error("Admin only."); st.stop()
-    section_models()
-elif choice == "Users (Admin)":
-    if role != "Admin": st.error("Admin only."); st.stop()
-    section_users()
+router()
