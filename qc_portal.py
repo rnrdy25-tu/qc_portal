@@ -1,16 +1,22 @@
 # Quality Management Portal — complete Streamlit app
 # --------------------------------------------------
-# Features:
+# What’s inside:
 # - Login with roles (Admin/QA/QC)
-# - Home menu (banner + tiles)
-# - First Piece create (dept, customer/supplier, top/bottom photos)
-# - Create Non-Conformity (fields matching provided layout, photo optional)
-# - Search & View (date range + filters + cards + optional export)
-# - Import CSV/Excel (browse -> preview -> import; mapping to DB)
+# - Home menu (banner + tiles + bottom nav)
+# - First Piece create (dept, customer/supplier, TOP/BOTTOM photos)
+# - Create Non-Conformity (layout matching your sheet, photo optional)
+# - Search & View (date range + filters + compact cards + optional exports)
+#   • For NC, shows the sheet’s event date (not the import time)
+#   • Filter by Customer/Supplier (auto-collected options)
+# - Import CSV/Excel (Browse → Preview → Import; no auto import)
 # - Personal page (change password)
 # - User setup (Admin only)
+#
+# Storage:
+#   DB   : /mount/data/qm_portal.sqlite3 (if writable) else /tmp/qc_portal/qm_portal.sqlite3
+#   Photos: ROOT/images/...
 
-import os, io, json, sqlite3, hashlib, base64
+import os, io, json, sqlite3, hashlib
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -87,7 +93,7 @@ SCHEMA = [
 def init_db():
     with conn() as c:
         for s in SCHEMA: c.execute(s)
-        # create default admin if missing
+        # default Admin
         cur = c.execute("SELECT COUNT(*) FROM users WHERE username='Admin'")
         if cur.fetchone()[0] == 0:
             h = hash_pwd("admin1234")
@@ -121,42 +127,39 @@ def can_delete_modify() -> bool:
     u = current_user()
     return u and (u["role"] in ("Admin", "QA"))
 
-from datetime import datetime
-import textwrap
-
+# --------------------------- Date helpers ---------------------------------- #
 def _parse_date_safe(s: str) -> str | None:
-    if not s:
-        return None
+    """Normalize a variety of date strings to 'YYYY-MM-DD' or return None."""
+    if s is None: return None
     s = str(s).strip()
-    # Try a few common formats (add more if you need)
-    fmts = ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"]
+    if not s: return None
+    fmts = [
+        "%Y-%m-%d", "%Y/%m/%d",
+        "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"
+    ]
     for f in fmts:
         try:
             return datetime.strptime(s, f).strftime("%Y-%m-%d")
         except Exception:
             pass
-    # last resort: try letting pandas parse if you already use it
     try:
-        return pd.to_datetime(s, errors="coerce").strftime("%Y-%m-%d")
+        v = pd.to_datetime(s, errors="coerce")
+        if pd.notna(v): return str(v.date())
     except Exception:
-        return None
+        pass
+    return None
 
-def display_date_for_row(row: dict) -> str:
-    """
-    Prefer the CSV's event date (extra.event_date) if present,
-    otherwise fall back to created_at.
-    """
+def nc_event_date_for_row(row: dict) -> str:
+    """Prefer CSV sheet event date (extra.created_date or Date); fallback to created_at."""
     extra = {}
     try:
         extra = json.loads(row.get("extra") or "{}")
     except Exception:
         pass
-
-    event_date = extra.get("event_date") or row.get("date")  # tolerate top-level 'date'
+    event_date = extra.get("created_date") or row.get("date")
     event_date = _parse_date_safe(event_date)
-    if event_date:
-        return event_date
-    # fallback: created_at (already iso)
+    if event_date: return event_date
     created = row.get("created_at")
     if created and isinstance(created, str) and len(created) >= 10:
         return created[:10]
@@ -166,13 +169,18 @@ def display_date_for_row(row: dict) -> str:
 def brand_banner():
     st.markdown("""
     <style>
-      .banner{background:linear-gradient(120deg,#e9f3ff 0%,#f7fbff 100%);padding:14px 18px;border-radius:16px;border:1px solid #e9eef5;margin-bottom:14px}
+      .banner{background:linear-gradient(120deg,#e9f3ff 0%,#f7fbff 100%);
+              padding:14px 18px;border-radius:16px;border:1px solid #e9eef5;margin-bottom:14px}
       .brandrow{display:flex;align-items:center;gap:14px}
       .brandrow .logo{font-size:32px}
       .brandrow .title{font-size:18px;font-weight:700;color:#1b2b59;line-height:1.2}
       .sub{font-size:13px;color:#4a5b88}
-      .tiles .stButton>button{height:120px;border-radius:18px;border:1px solid #edf0f6;box-shadow:0 1px 6px rgba(0,0,0,.05);font-weight:700}
+      .tiles .stButton>button{height:120px;border-radius:18px;border:1px solid #edf0f6;
+              box-shadow:0 1px 6px rgba(0,0,0,.05);font-weight:700}
       .tiles .stButton>button:hover{border-color:#9cc5ff;box-shadow:0 6px 16px rgba(0,0,0,.08)}
+      .card_extra{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}
+      .chip{background:#f6f8ff;border:1px solid #e8ecfd;color:#2c3b69;
+            padding:4px 8px;border-radius:12px;font-size:12px}
     </style>
     """, unsafe_allow_html=True)
     u = current_user()
@@ -205,16 +213,13 @@ def bottom_nav():
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("🏠 Home", use_container_width=True):
-            st.session_state["page"] = "HOME"
-            st.rerun()
+            st.session_state["page"] = "HOME"; st.rerun()
     with c2:
         if st.button("👤 Personal", use_container_width=True):
-            st.session_state["page"] = "PROFILE"
-            st.rerun()
+            st.session_state["page"] = "PROFILE"; st.rerun()
     with c3:
         if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
+            st.session_state.clear(); st.rerun()
 
 # --------------------------- Pages ----------------------------------------- #
 def page_login():
@@ -236,8 +241,7 @@ def page_login():
             if u and u["pass_hash"] == hash_pwd(pwd):
                 st.session_state["user"] = u
                 st.session_state["page"] = "HOME"
-                st.success("Welcome!")
-                st.experimental_rerun()
+                st.success("Welcome!"); st.experimental_rerun()
             else:
                 st.error("Invalid credentials.")
 
@@ -245,6 +249,7 @@ def page_home():
     require_login()
     brand_banner()
     st.markdown("### Main Menu")
+    st.markdown('<div class="tiles">', unsafe_allow_html=True)
     cols = st.columns(3, gap="large")
     if cols[0].button("📷 First Piece", use_container_width=True): st.session_state.page="FP"; st.rerun()
     if cols[1].button("🧩 Create NC", use_container_width=True): st.session_state.page="NC"; st.rerun()
@@ -255,6 +260,7 @@ def page_home():
     admin = current_user()["role"] == "Admin"
     if cols2[2].button("⚙️ User Setup", use_container_width=True, disabled=not admin):
         st.session_state.page="USERS"; st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def page_fp_create():
     require_login()
@@ -337,7 +343,7 @@ def page_nc_create():
 
         c15,c16,c17 = st.columns(3)
         defective_item     = c15.text_input("Defective Item")
-        defective_item_2   = c16.text_input("Defective Item (2)")  # in case of duplicate column
+        defective_item_2   = c16.text_input("Defective Item (2)")  # to cover duplicate column case
         defective_outflow  = c17.text_input("Defective Outflow")
 
         c18,c19,c20 = st.columns(3)
@@ -404,6 +410,7 @@ def page_search():
                 pass
     cs_list = ["(any)"] + sorted([x for x in cs_opts if x])
 
+    # Filters
     f1 = st.columns([1,1,1,1,1.5])
     model = f1[0].text_input("Model contains")
     vers  = f1[1].text_input("Version contains")
@@ -437,28 +444,40 @@ def page_search():
             q += f" ORDER BY id DESC LIMIT {int(limit)}"
             with conn() as c: df_fp = pd.read_sql_query(q, c, params=pa)
 
-        # NC
+        # NC (fetch broadly by import time, then refine by event date)
         if scope in ("Both","Non-Conformity only"):
-            qn, pn = "SELECT * FROM nc WHERE date(substr(created_at,1,10)) BETWEEN ? AND ?", [ds,de]
+            qn, pn = "SELECT * FROM nc", []
+            filters = []
             for col,val in (("model_no",model),("model_version",vers),("sn",sn),("mo",mo)):
-                if val: qn += f" AND {col} LIKE ?"; pn.append(f"%{val}%")
+                if val: filters.append(f"{col} LIKE ?"); pn.append(f"%{val}%")
             if textin:
-                qn += " AND (description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)"
+                filters.append("(description LIKE ? OR reporter LIKE ? OR severity LIKE ? OR extra LIKE ?)")
                 pn += [f"%{textin}%"]*4
-            qn += f" ORDER BY id DESC LIMIT {int(limit*2)}"
+            if filters:
+                qn += " WHERE " + " AND ".join(filters)
+            qn += " ORDER BY id DESC"
             with conn() as c: df_nc = pd.read_sql_query(qn, c, params=pn)
-            # filter by CS in JSON
-            if df_nc is not None and not df_nc.empty and cs_pick!="(any)":
-                def getcs(row):
-                    try: return (json.loads(row.get("extra") or "{}").get("customer_supplier") or "").strip()
-                    except: return ""
+
+            # refine by event-date range & CS in JSON
+            if df_nc is not None and not df_nc.empty:
                 df_nc = df_nc.copy()
-                df_nc["__cs__"] = df_nc.apply(getcs, axis=1)
-                df_nc = df_nc[df_nc["__cs__"]==cs_pick].drop(columns="__cs__").head(limit)
+                def _evt(r):
+                    try: return nc_event_date_for_row(r)
+                    except Exception: return ""
+                df_nc["__evt__"] = df_nc.apply(_evt, axis=1)
+                mask_date = (df_nc["__evt__"] >= ds) & (df_nc["__evt__"] <= de)
+                df_nc = df_nc[mask_date]
+                if cs_pick != "(any)":
+                    def _cs(r):
+                        try: return (json.loads(r.get("extra") or "{}").get("customer_supplier") or "").strip()
+                        except Exception: return ""
+                    df_nc["__cs__"] = df_nc.apply(_cs, axis=1)
+                    df_nc = df_nc[df_nc["__cs__"] == cs_pick]
+                df_nc = df_nc.drop(columns=[c for c in ["__evt__","__cs__"] if c in df_nc.columns]).head(limit)
 
         st.toast("Search complete.")
 
-    # Render FP cards
+    # ----- Render First-Piece cards -----
     if df_fp is not None:
         st.markdown(f"#### First Piece results ({len(df_fp)})")
         if df_fp.empty:
@@ -479,7 +498,7 @@ def page_search():
                             f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
                         )
                         st.caption(
-                            f"🕒 {r['created_at']} · 🧑‍💼 {r['reporter']} · "
+                            f"🕒 {r['created_at'][:16]} · 🧑‍💼 {r['reporter']} · "
                             f"🏷 Dept: {r.get('department') or '-'} · 👥 {r.get('customer_supplier') or '-'}"
                         )
                         if r.get("notes"): st.write(r["notes"])
@@ -490,7 +509,7 @@ def page_search():
                 "firstpiece_export.csv", "text/csv", use_container_width=True
             )
 
-    # Render NC cards
+    # ----- Render NC cards -----
     if df_nc is not None:
         st.markdown(f"#### Non-Conformity results ({len(df_nc)})")
         if df_nc.empty:
@@ -501,11 +520,12 @@ def page_search():
                     c0,c1 = st.columns([1,4])
                     p = ROOT/str(r["img"]) if r.get("img") else None
                     with c0:
-                        if p and p.exists(): st.image(str(p), width=160)
-                        # Add photo for NC (optional)
+                        if p and p.exists():
+                            st.image(str(p), width=160)
+                        # Add photo (optional)
                         add = st.file_uploader(f"Add photo (ID {r['id']})", type=["jpg","jpeg","png"], key=f"addimg_{r['id']}")
                         if add:
-                            newp = save_image(f"nc/{r['model_no'] or 'misc'}", add)
+                            newp = save_image(f"nc/{r.get('model_no') or 'misc'}", add)
                             with conn() as c:
                                 c.execute("UPDATE nc SET img=? WHERE id=?", (newp, int(r["id"])))
                                 c.commit()
@@ -515,22 +535,33 @@ def page_search():
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
                             f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
                         )
-                        st.caption(f"🕒 {r['created_at']} · 🧑‍💼 {r['reporter']} · 🏷 Category: {r.get('severity') or '-'}")
+                        # show event date (CSV) not import date
+                        evt = nc_event_date_for_row(r)
+                        st.caption(f"🕒 {evt} · 🧑‍💼 {r['reporter']} · 🏷 Category: {r.get('severity') or '-'}")
                         if r.get("description"): st.write(r["description"])
-                        # compact extra
+
+                        # compact extra as chips
                         try:
                             extra = json.loads(r.get("extra") or "{}")
                             if extra:
-                                pairs = [f"**{k.replace('_',' ')}:** {v}" for k,v in extra.items() if str(v).strip()]
-                                if pairs: st.markdown("  ".join(pairs))
+                                chips = []
+                                for k, v in extra.items():
+                                    v = str(v).strip()
+                                    if v:
+                                        key = k.replace("_", " ")
+                                        chips.append(f"<span class='chip'><b>{key}</b>: {v}</span>")
+                                if chips:
+                                    st.markdown("<div class='card_extra'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
                         except Exception:
                             pass
+
                         if can_delete_modify():
                             if st.button("Delete", key=f"d_nc_{r['id']}"):
                                 with conn() as c:
                                     c.execute("DELETE FROM nc WHERE id=?", (int(r["id"]),))
                                     c.commit()
                                 st.success("Deleted."); st.rerun()
+
             # export if results
             st.download_button(
                 "Download NC CSV",
@@ -539,19 +570,19 @@ def page_search():
             )
 
 def read_any_table(file) -> pd.DataFrame:
-    """Read CSV or Excel (xlsx/xls), robust encoding for CSV."""
+    """Read CSV or Excel (xlsx/xls) and normalize to str."""
     name = (file.name or "").lower()
     data = file.read()
     bio = io.BytesIO(data)
     if name.endswith((".xlsx",".xls")):
         return pd.read_excel(bio, dtype=str).fillna("")
-    # CSV: try utf-8 then big5 then cp1252
+    # CSV: try common encodings
     for enc in ("utf-8-sig","utf-8","big5","cp950","cp1252","latin1"):
         try:
             return pd.read_csv(io.BytesIO(data), dtype=str, encoding=enc).fillna("")
         except Exception:
             continue
-    # last resort: pandas sniff
+    # fallback sniff
     return pd.read_csv(io.BytesIO(data), dtype=str, engine="python", sep=None).fillna("")
 
 def page_import():
@@ -575,7 +606,6 @@ def page_import():
         st.dataframe(df.head(50), use_container_width=True, hide_index=True)
 
         # mapping from your Excel headers to NC columns
-        # If a header is slightly different, edit here once.
         MAP = {
             "Nonconformity": "severity",
             "Description of Nonconformity": "description",
@@ -607,26 +637,26 @@ def page_import():
             with conn() as c:
                 for _, row in df.iterrows():
                     try:
-                        # build nc record
                         model_no = row.get("Model/Part No.","")
-                        model_version = ""  # not typically in sheet
-                        sn = ""             # not typically in sheet
+                        model_version = ""  # usually not in sheet
+                        sn = ""             # usually not in sheet
                         mo = row.get("MO/PO","")
                         description = row.get("Description of Nonconformity","")
                         severity = row.get("Nonconformity","")
-                        # date
+
+                        # event date from sheet
                         cd = row.get("Date","")
-                        # normalize created_at
-                        created_at = None
+                        created_at = datetime.utcnow().isoformat()
                         if cd:
                             try:
+                                # keep a normalized string in extra + fallback stored created_at
                                 created_at = pd.to_datetime(cd).to_pydatetime().isoformat()
                             except Exception:
-                                created_at = datetime.utcnow().isoformat()
-                        else:
-                            created_at = datetime.utcnow().isoformat()
+                                pass
 
                         extra = { MAP[k]: row.get(k,"") for k in MAP if MAP[k] not in ("severity","description","created_date") }
+                        extra["created_date"] = row.get("Date","")
+
                         c.execute("""
                             INSERT INTO nc(created_at,model_no,model_version,sn,mo,description,severity,reporter,img,extra)
                             VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -666,8 +696,7 @@ def page_profile():
                     c.execute("UPDATE users SET pass_hash=? WHERE id=?", (hash_pwd(p1), u["id"]))
                     c.commit()
                 st.success("Password updated. Please re-login.")
-                st.session_state.clear()
-                st.rerun()
+                st.session_state.clear(); st.rerun()
 
 def page_users():
     require_login()
@@ -744,10 +773,9 @@ def router():
     elif page == "USERS":
         page_users()
     else:
-        st.session_state["page"] = "HOME"
-        st.rerun()
+        st.session_state["page"] = "HOME"; st.rerun()
 
-    # ⬇️ add this so the nav appears on all non-login pages
+    # show bottom nav on all non-login pages
     bottom_nav()
 
 # --------------------------- Boot ------------------------------------------ #
@@ -755,4 +783,3 @@ if __name__ == "__main__":
     init_db()
     if "page" not in st.session_state: st.session_state["page"] = "LOGIN"
     router()
-
