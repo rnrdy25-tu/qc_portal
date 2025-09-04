@@ -443,16 +443,16 @@ def page_search():
                         if r.get("notes"): st.write(r["notes"])
 
                         # --- Edit / Delete ---
-                        with st.popover("✏️ Edit", key=f"fp_edit_{r['id']}"):
+                        with st.expander("✏️ Edit", expanded=False):
                             c1,c2,c3 = st.columns(3)
-                            e_model = c1.text_input("Model", value=r["model_no"])
-                            e_ver   = c2.text_input("Version", value=r["model_version"])
-                            e_sn    = c3.text_input("SN", value=r["sn"])
+                            e_model = c1.text_input("Model", value=r["model_no"], key=f"fp_emodel_{r['id']}")
+                            e_ver   = c2.text_input("Version", value=r["model_version"], key=f"fp_ever_{r['id']}")
+                            e_sn    = c3.text_input("SN", value=r["sn"], key=f"fp_esn_{r['id']}")
                             c4,c5,c6 = st.columns(3)
-                            e_mo    = c4.text_input("MO", value=r["mo"])
-                            e_dept  = c5.text_input("Dept", value=r.get("department",""))
-                            e_cs    = c6.text_input("Customer/Supplier", value=r.get("customer_supplier",""))
-                            e_notes = st.text_area("Notes", value=r.get("notes",""))
+                            e_mo    = c4.text_input("MO", value=r["mo"], key=f"fp_emo_{r['id']}")
+                            e_dept  = c5.text_input("Dept", value=r.get("department",""), key=f"fp_edept_{r['id']}")
+                            e_cs    = c6.text_input("Customer/Supplier", value=r.get("customer_supplier",""), key=f"fp_ecs_{r['id']}")
+                            e_notes = st.text_area("Notes", value=r.get("notes",""), key=f"fp_enotes_{r['id']}")
                             if st.button("Save changes", key=f"fp_save_{r['id']}", type="primary"):
                                 update_fp(int(r["id"]), {
                                     "model_no": e_model.strip(), "model_version": e_ver.strip(),
@@ -506,27 +506,26 @@ def page_search():
                             pass
 
                         # --- Edit / Delete ---
-                        with st.popover("✏️ Edit", key=f"nc_edit_{r['id']}"):
+                        with st.expander("✏️ Edit", expanded=False):
                             c1,c2,c3,c4 = st.columns(4)
-                            e_model  = c1.text_input("Model", value=r["model_no"])
-                            e_ver    = c2.text_input("Version", value=r["model_version"])
-                            e_sn     = c3.text_input("SN", value=r["sn"])
-                            e_mo     = c4.text_input("MO", value=r["mo"])
-                            e_sev    = st.text_input("Nonconformity (category)", value=r.get("severity",""))
-                            e_desc   = st.text_area("Description", value=r.get("description",""))
-
-                            # editable subset of extra
+                            e_model  = c1.text_input("Model", value=r["model_no"], key=f"nc_emodel_{r['id']}")
+                            e_ver    = c2.text_input("Version", value=r["model_version"], key=f"nc_ever_{r['id']}")
+                            e_sn     = c3.text_input("SN", value=r["sn"], key=f"nc_esn_{r['id']}")
+                            e_mo     = c4.text_input("MO", value=r["mo"], key=f"nc_emo_{r['id']}")
+                            e_sev    = st.text_input("Nonconformity (category)", value=r.get("severity",""), key=f"nc_esev_{r['id']}")
+                            e_desc   = st.text_area("Description", value=r.get("description",""), key=f"nc_edesc_{r['id']}")
+                        
                             try: ex = json.loads(r.get("extra") or "{}")
                             except Exception: ex = {}
                             c5,c6,c7 = st.columns(3)
-                            e_cs   = c5.text_input("Customer/Supplier", value=ex.get("customer_supplier",""))
-                            e_line = c6.text_input("Line", value=ex.get("line",""))
-                            e_ws   = c7.text_input("Work Station", value=ex.get("work_station",""))
+                            e_cs   = c5.text_input("Customer/Supplier", value=ex.get("customer_supplier",""), key=f"nc_ecs_{r['id']}")
+                            e_line = c6.text_input("Line", value=ex.get("line",""), key=f"nc_eline_{r['id']}")
+                            e_ws   = c7.text_input("Work Station", value=ex.get("work_station",""), key=f"nc_ews_{r['id']}")
                             c8,c9,c10 = st.columns(3)
-                            e_resp = c8.text_input("Responsibility", value=ex.get("responsibility",""))
-                            e_root = c9.text_input("Root Cause", value=ex.get("root_cause",""))
-                            e_ca   = c10.text_input("Corrective Action", value=ex.get("corrective_action",""))
-
+                            e_resp = c8.text_input("Responsibility", value=ex.get("responsibility",""), key=f"nc_ersp_{r['id']}")
+                            e_root = c9.text_input("Root Cause", value=ex.get("root_cause",""), key=f"nc_eroot_{r['id']}")
+                            e_ca   = c10.text_input("Corrective Action", value=ex.get("corrective_action",""), key=f"nc_eca_{r['id']}")
+                        
                             if st.button("Save changes", key=f"nc_save_{r['id']}", type="primary"):
                                 update_nc(int(r["id"]),
                                           {"model_no": e_model.strip(), "model_version": e_ver.strip(),
@@ -710,3 +709,4 @@ if __name__ == "__main__":
     init_db()
     if "page" not in st.session_state: st.session_state["page"] = "LOGIN"
     router()
+
