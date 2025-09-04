@@ -94,14 +94,45 @@ def can_edit_delete():  # Admin or QA
 
 # =============================== Helpers ================================== #
 def save_img(subfolder: str, up) -> str:
-    """Save uploaded image and return relative path ROOT-relative."""
+    """
+    Save the uploaded file at full quality.
+    - If it's JPG/PNG/WEBP: store the original bytes (no recompress).
+    - Otherwise (e.g., HEIC): convert to a high-quality JPEG.
+    Returns a path relative to ROOT.
+    """
+    if not up:
+        return ""
+
     folder = IMGDIR / subfolder
     folder.mkdir(parents=True, exist_ok=True)
+
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    safe = (up.name or "img").replace(" ", "_")
-    out  = folder / f"{ts}_{safe}"
-    Image.open(up).convert("RGB").save(out, "JPEG", quality=92, subsampling=0)
-    return str(out.relative_to(ROOT))
+    orig_name = (up.name or "image").replace(" ", "_")
+    ext = Path(orig_name).suffix.lower()
+
+    as_is = {".jpg", ".jpeg", ".png", ".webp"}
+    out_path: Path
+
+    if ext in as_is:
+        # write original bytes exactly as uploaded (crisp)
+        out_path = folder / f"{ts}_{orig_name}"
+        data = up.getvalue()  # original bytes
+        with open(out_path, "wb") as f:
+            f.write(data)
+        return str(out_path.relative_to(ROOT))
+
+    # Attempt to open and convert (e.g., HEIC -> JPEG)
+    out_path = folder / f"{ts}_{Path(orig_name).stem}.jpg"
+    try:
+        img = Image.open(up)
+        img = img.convert("RGB")
+        img.save(out_path, "JPEG", quality=95, subsampling=0, optimize=True, progressive=True)
+        return str(out_path.relative_to(ROOT))
+    except UnidentifiedImageError:
+        # last resort: dump bytes (viewer might not support the format)
+        with open(out_path, "wb") as f:
+            f.write(up.getvalue())
+        return str(out_path.relative_to(ROOT))
 
 def evt_date_from_row(row: dict) -> str:
     """For NC: prefer sheet event date from extra.created_date (or Date) else created_at."""
@@ -117,7 +148,32 @@ def evt_date_from_row(row: dict) -> str:
             pass
     ca = row.get("created_at") or ""
     return ca[:10]
+    
+def show_image(relpath: str, caption: str | None = None, key: str | None = None, thumb_width: int = 520):
+    """
+    Render a crisp thumbnail + a full-size modal + download original.
+    relpath should be ROOT-relative, e.g. 'images/firstpiece/...'
+    """
+    if not relpath:
+        return
+    p = ROOT / str(relpath)
+    if not p.is_file():
+        return
 
+    # Larger, crisp thumbnail to avoid upscaling blur
+    st.image(str(p), width=thumb_width, caption=caption)
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("🔎 View full-size", key=f"view_full_{key or relpath}"):
+            with st.modal("Full-size image"):
+                st.image(str(p), use_container_width=True)
+    with c2:
+        try:
+            st.download_button("⬇️ Download original", data=p.read_bytes(), file_name=p.name, use_container_width=True)
+        except Exception:
+            pass
+            
 def banner():
     st.markdown("""
     <style>
@@ -208,6 +264,13 @@ def page_login():
                 st.session_state["page"] = "HOME"
                 st.success("Welcome!"); st.rerun()
             st.error("Invalid credentials.")
+            
+        st.markdown("""
+        <style>
+        /* Keep images crisp; avoid browser soft scaling artifacts */
+        img { image-rendering: auto; }
+        </style>
+        """, unsafe_allow_html=True)
 
 def page_home():
     require_login(); banner()
@@ -429,8 +492,10 @@ def page_search():
                     with imgL:
                         p_top = ROOT/str(r.get("img_top") or "")
                         p_bot = ROOT/str(r.get("img_bottom") or "")
-                        if p_top.is_file(): st.image(str(p_top), width=340, caption="TOP")
-                        if p_bot.is_file(): st.image(str(p_bot), width=340, caption="BOTTOM")
+                        if p_top.is_file():
+                            show_image(str(p_top.relative_to(ROOT)), "TOP", key=f"fp_top_{r['id']}", thumb_width=560)
+                        if p_bot.is_file():
+                            show_image(str(p_bot.relative_to(ROOT)), "BOTTOM", key=f"fp_bot_{r['id']}", thumb_width=560)
                     with infoR:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
@@ -479,7 +544,7 @@ def page_search():
                     with left:
                         p = ROOT/str(r.get("img") or "")
                         if p.is_file():
-                            st.image(str(p), width=360)
+                            show_image(str(p.relative_to(ROOT)), None, key=f"nc_{r['id']}", thumb_width=560)
                         add = st.file_uploader(f"Add photo (ID {r['id']})",
                                                type=["jpg","jpeg","png"], key=f"add_{r['id']}")
                         if add:
@@ -709,4 +774,5 @@ if __name__ == "__main__":
     init_db()
     if "page" not in st.session_state: st.session_state["page"] = "LOGIN"
     router()
+
 
