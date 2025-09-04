@@ -1,18 +1,15 @@
-# Quality Management Portal — Streamlit app (full)
-# -------------------------------------------------------------------
-# Features:
-# - Login (Admin/QA/QC) + User setup (Admin)
-# - Home menu (banner + big tiles + bottom nav)
-# - First Piece create (dept, customer/supplier, TOP/BOTTOM photos)
-# - Create NC (sheet-like layout, photo optional)
-# - Search & View: date range + filters + compact cards + exports
-#   • NC cards show the sheet event date (not import time)
-#   • Filter by Customer/Supplier (auto-collected options)
-# - Import CSV/Excel: Browse → Preview → Import (no auto import)
-# - Personal page (change password)
+# Quality Management Portal — Streamlit app (edit/delete + robust search)
+# ----------------------------------------------------------------------
+# - Login/roles (Admin, QA, QC)
+# - Home tiles + bottom nav
+# - Create First Piece (TOP/BOTTOM), Create NC
+# - Search & View with: date range, "All time", "Include undated", Customer/Supplier,
+#   large/sharp images, per-card Edit + Delete (with confirmation), diagnostics,
+#   CSV exports
+# - Import CSV/Excel (Preview -> Import; keeps sheet event date in extra.created_date)
 #
 # Storage:
-#   DB    : /mount/data/qm_portal.sqlite3 (if writable else /tmp/qc_portal/…)
+#   DB    : /mount/data/qm_portal.sqlite3 (fallback /tmp/qc_portal/…)
 #   Photos: ROOT/images/...
 
 import os, io, json, hashlib, sqlite3
@@ -23,7 +20,7 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 
-# --------------------------- Cloud-safe storage ---------------------------- #
+# =========================== Cloud-safe storage ============================ #
 def _data_root() -> Path:
     for p in (Path("/mount/data"), Path("/tmp/qc_portal")):
         try:
@@ -39,7 +36,7 @@ IMGDIR = ROOT / "images"
 IMGDIR.mkdir(parents=True, exist_ok=True)
 DB     = ROOT / "qm_portal.sqlite3"
 
-# --------------------------- DB ------------------------------------------- #
+# =============================== Database ================================= #
 def db():
     return sqlite3.connect(DB)
 
@@ -69,14 +66,14 @@ SCHEMA = [
 def init_db():
     with db() as c:
         for s in SCHEMA: c.execute(s)
-        # Seed admin
+        # seed admin
         cur = c.execute("SELECT COUNT(*) FROM users WHERE username='Admin'")
         if cur.fetchone()[0] == 0:
             c.execute("INSERT INTO users(username,pass_hash,display_name,role) VALUES(?,?,?,?)",
                       ("Admin", hash_pwd("admin1234"), "Admin", "Admin"))
         c.commit()
 
-# --------------------------- Auth ----------------------------------------- #
+# =============================== Auth ===================================== #
 def hash_pwd(p: str) -> str:
     return hashlib.sha256(("qmportal::" + p).encode("utf-8")).hexdigest()
 
@@ -95,9 +92,9 @@ def require_login():
 def can_edit_delete():  # Admin or QA
     u = me(); return u and u["role"] in ("Admin", "QA")
 
-# --------------------------- Helpers -------------------------------------- #
+# =============================== Helpers ================================== #
 def save_img(subfolder: str, up) -> str:
-    """Save uploaded image and return relative path."""
+    """Save uploaded image and return relative path ROOT-relative."""
     folder = IMGDIR / subfolder
     folder.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -107,7 +104,7 @@ def save_img(subfolder: str, up) -> str:
     return str(out.relative_to(ROOT))
 
 def evt_date_from_row(row: dict) -> str:
-    """For NC: prefer sheet date from extra.created_date (or Date) else created_at."""
+    """For NC: prefer sheet event date from extra.created_date (or Date) else created_at."""
     try:
         extra = json.loads(row.get("extra") or "{}")
     except Exception:
@@ -130,9 +127,6 @@ def banner():
       .brandrow .logo{font-size:30px}
       .brandrow .title{font-size:18px;font-weight:800;color:#1b2b59}
       .sub{font-size:13px;color:#4a5b88}
-      .tiles .stButton>button{height:120px;border-radius:18px;border:1px solid #edf0f6;
-              box-shadow:0 1px 6px rgba(0,0,0,.05);font-weight:700}
-      .tiles .stButton>button:hover{border-color:#9cc5ff;box-shadow:0 6px 16px rgba(0,0,0,.09)}
       .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
       .chip{background:#f6f8ff;border:1px solid #e8ecfd;color:#2c3b69;padding:4px 8px;border-radius:12px;font-size:12px}
     </style>
@@ -162,7 +156,44 @@ def bottom_nav():
     if c3.button("🚪 Logout", key="bn_out", use_container_width=True):
         st.session_state.clear(); st.rerun()
 
-# --------------------------- Pages ---------------------------------------- #
+# ======== Update & Delete (records) + tiny cache bust via rerun =========== #
+def update_fp(fp_id: int, payload: dict):
+    if not payload: return
+    fields = ", ".join([f"{k}=?" for k in payload.keys()])
+    vals = list(payload.values()) + [fp_id]
+    with db() as c:
+        c.execute(f"UPDATE first_piece SET {fields} WHERE id=?", vals); c.commit()
+    st.toast("First-Piece updated"); st.rerun()
+
+def delete_fp(fp_id: int):
+    with db() as c:
+        c.execute("DELETE FROM first_piece WHERE id=?", (fp_id,)); c.commit()
+    st.toast("First-Piece deleted"); st.rerun()
+
+def update_nc(nc_id: int, payload: dict, extra_upd: dict | None = None):
+    to_set = payload.copy()
+    if extra_upd is not None:
+        with db() as c:
+            row = c.execute("SELECT extra FROM nc WHERE id=?", (nc_id,)).fetchone()
+        cur_extra = {}
+        if row and row[0]:
+            try: cur_extra = json.loads(row[0])
+            except Exception: cur_extra = {}
+        cur_extra.update({k:v for k,v in (extra_upd or {}).items()})
+        to_set["extra"] = json.dumps(cur_extra, ensure_ascii=False)
+    if to_set:
+        fields = ", ".join([f"{k}=?" for k in to_set.keys()])
+        vals = list(to_set.values()) + [nc_id]
+        with db() as c:
+            c.execute(f"UPDATE nc SET {fields} WHERE id=?", vals); c.commit()
+    st.toast("NC updated"); st.rerun()
+
+def delete_nc(nc_id: int):
+    with db() as c:
+        c.execute("DELETE FROM nc WHERE id=?", (nc_id,)); c.commit()
+    st.toast("NC deleted"); st.rerun()
+
+# ============================== Pages ===================================== #
 def page_login():
     st.set_page_config(page_title="Quality Management Portal", layout="wide")
     st.markdown("<h2 style='text-align:center;margin-top:8vh'>🔐 Quality Management Portal</h2>", unsafe_allow_html=True)
@@ -181,7 +212,6 @@ def page_login():
 def page_home():
     require_login(); banner()
     st.markdown("### Main Menu")
-    st.markdown('<div class="tiles">', unsafe_allow_html=True)
     r1 = st.columns(3, gap="large")
     if r1[0].button("📷 First Piece", use_container_width=True): st.session_state.page="FP"; st.rerun()
     if r1[1].button("🧩 Create NC", use_container_width=True): st.session_state.page="NC"; st.rerun()
@@ -192,7 +222,6 @@ def page_home():
     admin = me()["role"] == "Admin"
     if r2[2].button("⚙️ User Setup", use_container_width=True, disabled=not admin):
         st.session_state.page="USERS"; st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
 
 def page_fp_create():
     require_login(); banner()
@@ -318,31 +347,41 @@ def page_search():
     mo = f1[3].text_input("MO contains")
     t  = f1[4].text_input("Text in description/reporter/type/extra")
 
-    f2 = st.columns([1.2,1.2,1,2])
+    f2 = st.columns([1.2,1.2,1,1,2])
     cs = f2[0].selectbox("Customer / Supplier", _cs_options())
     scope = f2[1].selectbox("Scope", ["Both","First Piece only","Non-Conformity only"])
-    limit = f2[2].slider("Max per section", 20, 300, 80, 20)
+    limit = f2[2].slider("Max per section", 20, 500, 200, 20)
+    alltime = f2[3].checkbox("All time", value=False)
 
-    dcol = st.columns([1,1,4])
-    d_from = dcol[0].date_input("From", date.today()-timedelta(days=30))
+    dcol = st.columns([1,1,3])
+    d_from = dcol[0].date_input("From", date.today()-timedelta(days=90))
     d_to   = dcol[1].date_input("To", date.today())
+    include_undated = dcol[2].checkbox("Include undated rows", value=True)
+
+    if alltime:
+        d_from = date(1900,1,1); d_to = date(2100,12,31)
     if d_from > d_to: d_from, d_to = d_to, d_from
     ds, de = d_from.strftime("%Y-%m-%d"), d_to.strftime("%Y-%m-%d")
 
     go = st.button("Search", type="primary")
 
     df_fp = df_nc = None
+    diag = {"fp_raw": 0, "fp_after": 0, "nc_raw": 0, "nc_after": 0}
+
     if go:
-        # First piece query by import date
+        # First piece by import timestamp (created_at)
         if scope in ("Both","First Piece only"):
             q, pa = "SELECT * FROM first_piece WHERE date(substr(created_at,1,10)) BETWEEN ? AND ?", [ds,de]
             for col,val in (("model_no",m),("model_version",v),("sn",s),("mo",mo)):
                 if val: q += f" AND {col} LIKE ?"; pa.append(f"%{val}%")
             if cs != "(any)": q += " AND customer_supplier=?"; pa.append(cs)
-            q += f" ORDER BY id DESC LIMIT {int(limit)}"
-            with db() as c: df_fp = pd.read_sql_query(q, c, params=pa)
+            q += " ORDER BY id DESC"
+            with db() as c: raw = pd.read_sql_query(q, c, params=pa)
+            diag["fp_raw"] = len(raw)
+            df_fp = raw.head(limit)
+            diag["fp_after"] = len(df_fp)
 
-        # NC: fetch broadly then filter by event date & CS
+        # NC: fetch broadly, then filter by event date & CS in JSON
         if scope in ("Both","Non-Conformity only"):
             q, pa, flt = "SELECT * FROM nc", [], []
             for col,val in (("model_no",m),("model_version",v),("sn",s),("mo",mo)):
@@ -352,19 +391,31 @@ def page_search():
                 pa += [f"%{t}%"]*4
             if flt: q += " WHERE " + " AND ".join(flt)
             q += " ORDER BY id DESC"
-            with db() as c: df_nc = pd.read_sql_query(q, c, params=pa)
-            if df_nc is not None and not df_nc.empty:
-                df_nc = df_nc.copy()
-                df_nc["__evt__"] = df_nc.apply(evt_date_from_row, axis=1)
-                df_nc = df_nc[(df_nc["__evt__"]>=ds) & (df_nc["__evt__"]<=de)]
+            with db() as c: raw = pd.read_sql_query(q, c, params=pa)
+            diag["nc_raw"] = len(raw)
+            if not raw.empty:
+                raw = raw.copy()
+                raw["__evt__"] = raw.apply(evt_date_from_row, axis=1)
+                mask = (raw["__evt__"] >= ds) & (raw["__evt__"] <= de)
+                if include_undated:
+                    mask = mask | (raw["__evt__"] == "")
                 if cs != "(any)":
                     def _jcs(r):
                         try: return (json.loads(r.get("extra") or "{}").get("customer_supplier") or "").strip()
                         except Exception: return ""
-                    df_nc["__cs__"] = df_nc.apply(_jcs, axis=1)
-                    df_nc = df_nc[df_nc["__cs__"]==cs]
-                df_nc = df_nc.drop(columns=[c for c in ["__evt__","__cs__"] if c in df_nc.columns]).head(limit)
+                    raw["__cs__"] = raw.apply(_jcs, axis=1)
+                    mask = mask & ((raw["__cs__"] == cs) | (raw["__cs__"].isna()))
+                df_nc = raw[mask].drop(columns=[c for c in ["__evt__","__cs__"] if c in raw.columns]).head(limit)
+            else:
+                df_nc = raw
+            diag["nc_after"] = len(df_nc)
         st.toast("Search complete.")
+
+    # Diagnostics so you see WHY only 3 appear
+    if go:
+        with st.expander("Search diagnostics"):
+            st.write(diag)
+            st.caption("Tip: set **All time** ON and/or **Include undated rows** to widen results.")
 
     # ---------- First Piece cards
     if df_fp is not None:
@@ -378,8 +429,8 @@ def page_search():
                     with imgL:
                         p_top = ROOT/str(r.get("img_top") or "")
                         p_bot = ROOT/str(r.get("img_bottom") or "")
-                        if p_top.is_file(): st.image(str(p_top), width=320, caption="TOP")
-                        if p_bot.is_file(): st.image(str(p_bot), width=320, caption="BOTTOM")
+                        if p_top.is_file(): st.image(str(p_top), width=340, caption="TOP")
+                        if p_bot.is_file(): st.image(str(p_bot), width=340, caption="BOTTOM")
                     with infoR:
                         st.markdown(
                             f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
@@ -390,15 +441,31 @@ def page_search():
                             f"🏷 Dept: {r.get('department') or '-'} · 👥 {r.get('customer_supplier') or '-'}"
                         )
                         if r.get("notes"): st.write(r["notes"])
+
+                        # --- Edit / Delete ---
+                        with st.popover("✏️ Edit", key=f"fp_edit_{r['id']}"):
+                            c1,c2,c3 = st.columns(3)
+                            e_model = c1.text_input("Model", value=r["model_no"])
+                            e_ver   = c2.text_input("Version", value=r["model_version"])
+                            e_sn    = c3.text_input("SN", value=r["sn"])
+                            c4,c5,c6 = st.columns(3)
+                            e_mo    = c4.text_input("MO", value=r["mo"])
+                            e_dept  = c5.text_input("Dept", value=r.get("department",""))
+                            e_cs    = c6.text_input("Customer/Supplier", value=r.get("customer_supplier",""))
+                            e_notes = st.text_area("Notes", value=r.get("notes",""))
+                            if st.button("Save changes", key=f"fp_save_{r['id']}", type="primary"):
+                                update_fp(int(r["id"]), {
+                                    "model_no": e_model.strip(), "model_version": e_ver.strip(),
+                                    "sn": e_sn.strip(), "mo": e_mo.strip(), "department": e_dept.strip(),
+                                    "customer_supplier": e_cs.strip(), "notes": e_notes.strip()
+                                })
                         if can_edit_delete():
-                            if st.button("Delete", key=f"del_fp_{r['id']}"):
-                                with db() as c:
-                                    c.execute("DELETE FROM first_piece WHERE id=?", (int(r["id"]),))
-                                    c.commit()
-                                st.success("Deleted."); st.rerun()
-        st.download_button("Download First-Piece CSV",
-                           df_fp.to_csv(index=False).encode("utf-8"),
-                           "firstpiece_export.csv", "text/csv", use_container_width=True)
+                            if st.button("🗑 Delete", key=f"fp_del_{r['id']}", type="secondary"):
+                                delete_fp(int(r["id"]))
+        if len(df_fp):
+            st.download_button("Download First-Piece CSV",
+                               df_fp.to_csv(index=False).encode("utf-8"),
+                               "firstpiece_export.csv", "text/csv", use_container_width=True)
 
     # ---------- NC cards
     if df_nc is not None:
@@ -412,7 +479,7 @@ def page_search():
                     with left:
                         p = ROOT/str(r.get("img") or "")
                         if p.is_file():
-                            st.image(str(p), width=340)
+                            st.image(str(p), width=360)
                         add = st.file_uploader(f"Add photo (ID {r['id']})",
                                                type=["jpg","jpeg","png"], key=f"add_{r['id']}")
                         if add:
@@ -428,7 +495,8 @@ def page_search():
                         )
                         st.caption(f"🕒 {evt_date_from_row(r)} · 🧑‍💼 {r['reporter']} · 🏷 Category: {r.get('severity') or '-'}")
                         if r.get("description"): st.write(r["description"])
-                        # compact JSON to chips
+
+                        # chips from JSON
                         try:
                             extra = json.loads(r.get("extra") or "{}")
                             chips = [f"<span class='chip'><b>{k.replace('_',' ')}</b>: {str(v).strip()}</span>"
@@ -436,15 +504,44 @@ def page_search():
                             if chips: st.markdown("<div class='chips'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
                         except Exception:
                             pass
+
+                        # --- Edit / Delete ---
+                        with st.popover("✏️ Edit", key=f"nc_edit_{r['id']}"):
+                            c1,c2,c3,c4 = st.columns(4)
+                            e_model  = c1.text_input("Model", value=r["model_no"])
+                            e_ver    = c2.text_input("Version", value=r["model_version"])
+                            e_sn     = c3.text_input("SN", value=r["sn"])
+                            e_mo     = c4.text_input("MO", value=r["mo"])
+                            e_sev    = st.text_input("Nonconformity (category)", value=r.get("severity",""))
+                            e_desc   = st.text_area("Description", value=r.get("description",""))
+
+                            # editable subset of extra
+                            try: ex = json.loads(r.get("extra") or "{}")
+                            except Exception: ex = {}
+                            c5,c6,c7 = st.columns(3)
+                            e_cs   = c5.text_input("Customer/Supplier", value=ex.get("customer_supplier",""))
+                            e_line = c6.text_input("Line", value=ex.get("line",""))
+                            e_ws   = c7.text_input("Work Station", value=ex.get("work_station",""))
+                            c8,c9,c10 = st.columns(3)
+                            e_resp = c8.text_input("Responsibility", value=ex.get("responsibility",""))
+                            e_root = c9.text_input("Root Cause", value=ex.get("root_cause",""))
+                            e_ca   = c10.text_input("Corrective Action", value=ex.get("corrective_action",""))
+
+                            if st.button("Save changes", key=f"nc_save_{r['id']}", type="primary"):
+                                update_nc(int(r["id"]),
+                                          {"model_no": e_model.strip(), "model_version": e_ver.strip(),
+                                           "sn": e_sn.strip(), "mo": e_mo.strip(),
+                                           "severity": e_sev.strip(), "description": e_desc.strip()},
+                                          {"customer_supplier": e_cs.strip(), "line": e_line.strip(),
+                                           "work_station": e_ws.strip(), "responsibility": e_resp.strip(),
+                                           "root_cause": e_root.strip(), "corrective_action": e_ca.strip()})
                         if can_edit_delete():
-                            if st.button("Delete", key=f"del_nc_{r['id']}"):
-                                with db() as c:
-                                    c.execute("DELETE FROM nc WHERE id=?", (int(r["id"]),))
-                                    c.commit()
-                                st.success("Deleted."); st.rerun()
-        st.download_button("Download NC CSV",
-                           df_nc.to_csv(index=False).encode("utf-8"),
-                           "nc_export.csv", "text/csv", use_container_width=True)
+                            if st.button("🗑 Delete", key=f"nc_del_{r['id']}", type="secondary"):
+                                delete_nc(int(r["id"]))
+        if len(df_nc):
+            st.download_button("Download NC CSV",
+                               df_nc.to_csv(index=False).encode("utf-8"),
+                               "nc_export.csv", "text/csv", use_container_width=True)
 
 def _read_table(file) -> pd.DataFrame:
     """Read CSV/XLSX with encoding fallbacks and return str df."""
@@ -478,7 +575,7 @@ def page_import():
     df = st.session_state.get("import_df")
     if df is None: return
 
-    st.dataframe(df.head(50), use_container_width=True, hide_index=True)
+    st.dataframe(df.head(100), use_container_width=True, hide_index=True)
 
     MAP = {  # Excel header -> json/columns
         "Nonconformity": "severity",
@@ -595,7 +692,7 @@ def page_users():
                               (hash_pwd("123456"), uid)); c.commit()
                 st.success("Password reset.")
 
-# --------------------------- Router / Boot -------------------------------- #
+# ============================ Router / Boot ================================ #
 def router():
     page = st.session_state.get("page", "LOGIN")
     if page == "LOGIN":   page_login();  return
